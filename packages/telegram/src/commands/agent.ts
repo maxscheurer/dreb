@@ -87,6 +87,18 @@ export async function cmdStats(ctx: Context, userState: UserState): Promise<void
 			}
 		}
 
+		try {
+			const perf = await bridge.getPerformanceStats();
+			if (perf?.models && perf.models.length > 0) {
+				lines.push("\n⚡ *Performance (last 24h):*");
+				for (const m of perf.models) {
+					lines.push(`  ${m.provider}/${m.modelId}: ~${m.median.toFixed(1)} tok/s (n=${m.count})`);
+				}
+			}
+		} catch (e) {
+			log(`[CMD] /stats performance section error: ${e}`);
+		}
+
 		await safeSend(ctx.api, chatId, lines.join("\n"));
 	} catch (e) {
 		log(`[CMD] /stats error: ${e}`);

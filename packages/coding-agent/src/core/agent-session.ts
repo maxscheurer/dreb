@@ -14,6 +14,7 @@
  */
 
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Agent, AgentEvent, AgentMessage, AgentState, AgentTool, ThinkingLevel } from "@dreb/agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@dreb/ai";
@@ -65,6 +66,7 @@ import { checkScriptContent, extractScriptPaths, isForbiddenCommand } from "./fo
 import { type GitRepoState, getGitRepoState } from "./git-repo-state.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { PerformanceTracker } from "./performance-tracker.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import { type SecretPattern, scrubSecrets } from "./secret-scrubber.js";
@@ -162,6 +164,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** UI type for system prompt context (e.g. "tui", "telegram", "rpc") */
 	uiType?: string;
+	/** Optional performance tracker override, primarily for isolated tests. */
+	performanceTracker?: PerformanceTracker;
 }
 
 export interface ExtensionBindings {
@@ -225,6 +229,7 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Thinking levels including xhigh (for supported models) */
 const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const MIN_PERFORMANCE_DURATION_MS = 10;
 
 // ============================================================================
 // AgentSession Class
@@ -312,6 +317,9 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _uiType?: string;
 
+	private performanceTracker: PerformanceTracker;
+	private _ownsPerformanceTracker: boolean;
+
 	// Git repo state captured once at session start
 	private _gitRepoState: GitRepoState | undefined;
 
@@ -319,6 +327,19 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		if (config.performanceTracker !== undefined) {
+			this.performanceTracker = config.performanceTracker;
+			this._ownsPerformanceTracker = false;
+		} else if (process.env.VITEST) {
+			// In tests, use an isolated temp log to avoid polluting the real performance log
+			this.performanceTracker = new PerformanceTracker(
+				join(tmpdir(), `dreb-perf-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`),
+			);
+			this._ownsPerformanceTracker = true;
+		} else {
+			this.performanceTracker = new PerformanceTracker();
+			this._ownsPerformanceTracker = true;
+		}
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -347,6 +368,11 @@ export class AgentSession {
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this._modelRegistry;
+	}
+
+	/** Performance tracker for recording and querying model throughput */
+	getPerformanceTracker(): PerformanceTracker {
+		return this.performanceTracker;
 	}
 
 	/**
@@ -844,6 +870,24 @@ export class AgentSession {
 					});
 					this._retryAttempt = 0;
 				}
+
+				const durationMs = assistantMsg.durationMs ?? 0;
+				if (
+					assistantMsg.stopReason !== "error" &&
+					assistantMsg.stopReason !== "aborted" &&
+					assistantMsg.usage.output > 0 &&
+					durationMs >= MIN_PERFORMANCE_DURATION_MS
+				) {
+					this.performanceTracker.record({
+						timestamp: new Date().toISOString(),
+						sessionId: this.sessionId,
+						provider: assistantMsg.provider,
+						modelId: assistantMsg.model,
+						outputTokens: assistantMsg.usage.output,
+						durationMs,
+						tps: (assistantMsg.usage.output * 1000) / durationMs,
+					});
+				}
 			}
 		}
 
@@ -1018,6 +1062,9 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		this._disconnectFromAgent();
+		if (this._ownsPerformanceTracker) {
+			this.performanceTracker.dispose();
+		}
 		this._eventListeners = [];
 	}
 

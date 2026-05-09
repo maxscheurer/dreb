@@ -53,6 +53,17 @@ function createSession(options: {
 		modelRegistry: {
 			isUsingOAuth: () => false,
 		},
+		getPerformanceTracker: () => ({
+			getRollingAverage: () => ({ median: 0, mean: 0, count: 0 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 0,
+				recentMedian: 0,
+				percentDelta: 0,
+				direction: "stable",
+				baselineCount: 0,
+				recentCount: 0,
+			}),
+		}),
 	};
 
 	return session as unknown as AgentSession;
@@ -155,5 +166,207 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("renders TPS suffix with median delta when sufficient samples exist", () => {
+		const width = 120;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		// Override getPerformanceTracker to return a non-zero count
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 30.5, mean: 32, count: 10 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30,
+				recentMedian: 33,
+				percentDelta: 10,
+				direction: "above",
+				baselineCount: 10,
+				recentCount: 3,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const lines = footer.render(width);
+		const statsLine = lines[1];
+		expect(statsLine).toContain("~31 tok/s");
+		expect(statsLine).toContain("10%");
+		expect(statsLine).toContain("↑");
+		expect(statsLine).toContain("median");
+	});
+
+	it("renders stable median delta when rounded TPS is unchanged", () => {
+		const width = 120;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 30.4, mean: 30.4, count: 10 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30.4,
+				recentMedian: 30.6,
+				percentDelta: 0.66,
+				direction: "stable",
+				baselineCount: 10,
+				recentCount: 3,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = footer.render(width)[1];
+		expect(statsLine).toContain("~30 tok/s");
+		expect(statsLine).toContain("0%");
+		expect(statsLine).toContain("→");
+		expect(statsLine).toContain("median");
+	});
+
+	it("keeps all lines within width with TPS suffix at narrow width", () => {
+		const width = 60;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 30.5, mean: 32, count: 10 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30,
+				recentMedian: 33,
+				percentDelta: 10,
+				direction: "above",
+				baselineCount: 10,
+				recentCount: 3,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const lines = footer.render(width);
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("renders below trend arrow and warning color", () => {
+		const width = 120;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 25, mean: 26, count: 10 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30,
+				recentMedian: 25,
+				percentDelta: -16.7,
+				direction: "below",
+				baselineCount: 10,
+				recentCount: 3,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = footer.render(width)[1];
+		expect(statsLine).toContain("↓");
+		expect(statsLine).toContain("17%");
+		expect(statsLine).toContain("median");
+	});
+
+	it("renders TPS suffix without median delta when sample counts are insufficient", () => {
+		const width = 120;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 30.5, mean: 32, count: 10 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30,
+				recentMedian: 30,
+				percentDelta: 0,
+				direction: "stable",
+				baselineCount: 10,
+				recentCount: 2,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = footer.render(width)[1];
+		expect(statsLine).toContain("~31 tok/s");
+		expect(statsLine).not.toContain("median");
+		// The TPS suffix itself should not contain a percent sign (context % is separate)
+		expect(statsLine).not.toMatch(/tok\/s.*%/);
+	});
+
+	it("omits TPS suffix when sample count is below threshold", () => {
+		const width = 120;
+		const session = createSession({
+			sessionName: "test",
+			modelId: "claude-3-sonnet",
+			provider: "anthropic",
+			usage: {
+				input: 1000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		(session as any).getPerformanceTracker = () => ({
+			getRollingAverage: () => ({ median: 30, mean: 32, count: 1 }),
+			getPerformanceDelta: () => ({
+				baselineMedian: 30,
+				recentMedian: 30,
+				percentDelta: 0,
+				direction: "stable",
+				baselineCount: 1,
+				recentCount: 1,
+			}),
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const lines = footer.render(width);
+		const statsLine = lines[1];
+		expect(statsLine).not.toContain("tok/s");
 	});
 });
