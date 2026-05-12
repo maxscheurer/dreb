@@ -19,11 +19,19 @@ fi
 VERSION=$(node -p "require('./package.json').version")
 echo "Syncing version $VERSION to all packages..."
 
+# Set version and pin @dreb/* inter-package deps to exact version
+# Pinning ensures package managers (especially bun) install matching versions
 for pkg in packages/*/package.json; do
 	node -e "
 		const fs = require('fs');
 		const pkg = JSON.parse(fs.readFileSync('$pkg', 'utf-8'));
 		pkg.version = '$VERSION';
+		for (const depType of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+			if (!pkg[depType]) continue;
+			for (const name of Object.keys(pkg[depType])) {
+				if (name.startsWith('@dreb/')) pkg[depType][name] = '$VERSION';
+			}
+		}
 		fs.writeFileSync('$pkg', JSON.stringify(pkg, null, '\t') + '\n');
 	"
 	echo "  $pkg -> $VERSION"
@@ -39,29 +47,6 @@ for plugin_json in packages/*/.claude-plugin/plugin.json; do
 		fs.writeFileSync('$plugin_json', JSON.stringify(p, null, '  ') + '\n');
 	"
 	echo "  $plugin_json -> $VERSION"
-done
-
-# Update @dreb/* inter-package dependency specifiers to exact version
-# This ensures package managers (especially bun) install matching versions
-for pkg in packages/*/package.json; do
-	node -e "
-		const fs = require('fs');
-		const pkg = JSON.parse(fs.readFileSync('$pkg', 'utf-8'));
-		let changed = false;
-		for (const depType of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-			if (!pkg[depType]) continue;
-			for (const [name, ver] of Object.entries(pkg[depType])) {
-				if (name.startsWith('@dreb/') && ver !== '$VERSION') {
-					pkg[depType][name] = '$VERSION';
-					changed = true;
-				}
-			}
-		}
-		if (changed) {
-			fs.writeFileSync('$pkg', JSON.stringify(pkg, null, '\t') + '\n');
-			console.log('  $pkg @dreb/* deps -> $VERSION');
-		}
-	"
 done
 
 # Refresh package-lock.json so workspace versions match
