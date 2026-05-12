@@ -41,6 +41,29 @@ for plugin_json in packages/*/.claude-plugin/plugin.json; do
 	echo "  $plugin_json -> $VERSION"
 done
 
+# Update @dreb/* inter-package dependency specifiers to exact version
+# This ensures package managers (especially bun) install matching versions
+for pkg in packages/*/package.json; do
+	node -e "
+		const fs = require('fs');
+		const pkg = JSON.parse(fs.readFileSync('$pkg', 'utf-8'));
+		let changed = false;
+		for (const depType of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+			if (!pkg[depType]) continue;
+			for (const [name, ver] of Object.entries(pkg[depType])) {
+				if (name.startsWith('@dreb/') && ver !== '$VERSION') {
+					pkg[depType][name] = '$VERSION';
+					changed = true;
+				}
+			}
+		}
+		if (changed) {
+			fs.writeFileSync('$pkg', JSON.stringify(pkg, null, '\t') + '\n');
+			console.log('  $pkg @dreb/* deps -> $VERSION');
+		}
+	"
+done
+
 # Refresh package-lock.json so workspace versions match
 npm install --package-lock-only --ignore-scripts --install-links=false 2>/dev/null
 echo "  package-lock.json refreshed"

@@ -52,10 +52,10 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@dreb/agent-core": "*",
-		"@dreb/ai": "*",
-		"@dreb/semantic-search": "*",
-		"@dreb/tui": "*",
+		"@dreb/agent-core": "2.17.0",
+		"@dreb/ai": "2.17.0",
+		"@dreb/semantic-search": "2.17.0",
+		"@dreb/tui": "2.17.0",
 		"@huggingface/transformers": "^4.0.1",
 		"@mariozechner/jiti": "^2.6.2",
 		"@silvia-odwyer/photon-node": "^0.3.4",
