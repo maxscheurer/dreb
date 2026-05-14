@@ -81,6 +81,7 @@ export {
 	type BackgroundAgentInfo,
 	createSubagentTool,
 	createSubagentToolDefinition,
+	filterSubagentTools,
 	getBackgroundAgents,
 	getRunningBackgroundAgents,
 	pruneBackgroundAgents,
@@ -116,6 +117,16 @@ export {
 	truncateLine,
 	truncateTail,
 } from "./truncate.js";
+export {
+	createWaitToolDefinition,
+	formatWaitCall,
+	formatWaitResult,
+	type WaitAgentInfo,
+	type WaitToolDetails,
+	type WaitToolInput,
+	type WaitToolOptions,
+	waitToolDefinition,
+} from "./wait.js";
 export {
 	createWebFetchTool,
 	createWebFetchToolDefinition,
@@ -166,6 +177,7 @@ import { createSkillTool, createSkillToolDefinition, type SkillToolOptions } fro
 import {
 	createSubagentTool,
 	createSubagentToolDefinition,
+	getRunningBackgroundAgents,
 	type SubagentToolOptions,
 	subagentTool,
 	subagentToolDefinition,
@@ -174,6 +186,7 @@ import { createSuggestNextToolDefinition, type SuggestNextCallback } from "./sug
 import { createTasksToolDefinition, type TasksUpdateCallback } from "./tasks.js";
 import { createTmpReadToolDefinition } from "./tmp-read.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
+import { createWaitToolDefinition, waitToolDefinition } from "./wait.js";
 import {
 	createWebFetchTool,
 	createWebFetchToolDefinition,
@@ -194,6 +207,7 @@ export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
 
 const tmpReadToolDefinition = createTmpReadToolDefinition();
 const tmpReadTool = wrapToolDefinition(tmpReadToolDefinition);
+const waitTool = wrapToolDefinition(waitToolDefinition);
 
 export const allTools = {
 	read: readTool,
@@ -207,6 +221,7 @@ export const allTools = {
 	web_fetch: webFetchTool,
 	subagent: subagentTool,
 	tmp_read: tmpReadTool,
+	wait: waitTool,
 };
 
 export const allToolDefinitions = {
@@ -221,6 +236,7 @@ export const allToolDefinitions = {
 	web_fetch: webFetchToolDefinition,
 	subagent: subagentToolDefinition,
 	tmp_read: tmpReadToolDefinition,
+	wait: waitToolDefinition,
 };
 
 export type ToolName = keyof typeof allTools;
@@ -265,6 +281,7 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		web_fetch: createWebFetchToolDefinition(cwd),
 		subagent: createSubagentToolDefinition(cwd, options?.subagent),
 		tmp_read: createTmpReadToolDefinition(options?.read),
+		wait: createWaitToolDefinition({ getRunningAgents: getRunningBackgroundAgents }),
 	};
 	if (isSearchAvailable()) {
 		tools.search = createSearchToolDefinition(cwd);
@@ -307,6 +324,7 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		web_fetch: createWebFetchTool(cwd),
 		subagent: createSubagentTool(cwd, options?.subagent),
 		tmp_read: wrapToolDefinition(createTmpReadToolDefinition(options?.read)),
+		wait: wrapToolDefinition(createWaitToolDefinition({ getRunningAgents: getRunningBackgroundAgents })),
 	};
 	if (isSearchAvailable()) {
 		tools.search = createSearchTool(cwd);
