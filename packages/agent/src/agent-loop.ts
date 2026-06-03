@@ -6,6 +6,7 @@
 import {
 	type AssistantMessage,
 	type Context,
+	DEFAULT_MAX_OUTPUT_TOKENS,
 	EventStream,
 	streamSimple,
 	type ToolResultMessage,
@@ -365,6 +366,13 @@ async function streamAssistantResponse(
 
 	const maxRetries = config.streamRetries ?? 3;
 	const retryBaseDelay = config.streamRetryBaseDelayMs ?? 1000;
+	const lengthRetries = config.lengthRetries ?? 2;
+	const lengthMultiplier = config.lengthRetryBudgetMultiplier ?? 2;
+	// The maxTokens budget requested for the current attempt. Starts at the
+	// caller-configured budget (may be undefined → provider default) and is
+	// escalated on each length retry. Kept separate from stream-drop retries.
+	let requestMaxTokens = config.maxTokens;
+	let lengthAttempts = 0;
 	const clonePartialForDebug = (): AssistantMessage | undefined => {
 		if (!partialMessage) return undefined;
 		return {
@@ -374,29 +382,60 @@ async function streamAssistantResponse(
 		};
 	};
 
-	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+	// Discard the truncated partial message (if any) before re-issuing a request.
+	const discardPartial = () => {
+		if (addedPartial) {
+			context.messages.pop();
+			addedPartial = false;
+		}
+		partialMessage = null;
+	};
+
+	// Compute the escalated token budget for a length retry, never exceeding the
+	// model's ceiling. `current` is the *effective* budget that produced the
+	// truncated response (resolved from the provider default when no explicit
+	// maxTokens was set), so the escalation always requests strictly more.
+	const escalateLengthBudget = (current: number): number => {
+		const ceiling = config.model.maxTokens;
+		return Math.min(Math.ceil(current * lengthMultiplier), ceiling);
+	};
+
+	// Build the truncation failure message after length retries are exhausted.
+	const createLengthExhaustedMessage = (attempts: number): AssistantMessage => {
+		const errorMessage = createErrorMessage(
+			new Error(
+				`Response truncated at token limit after ${attempts} attempt${attempts === 1 ? "" : "s"} — output exceeded the model's maximum token budget`,
+			),
+		);
+		// Force "error" so the runLoop error guard terminates the turn loudly.
+		errorMessage.stopReason = signal?.aborted ? "aborted" : "error";
+		return errorMessage;
+	};
+
+	// stream-drop retries are counted separately from length retries. A length retry
+	// is a fresh request, so it resets the stream-drop attempt counter.
+	let streamDropAttempt = 0;
+	while (true) {
 		let response: Awaited<ReturnType<StreamFn>>;
 		try {
 			response = await streamFunction(config.model, llmContext, {
 				...config,
+				maxTokens: requestMaxTokens,
 				apiKey: resolvedApiKey,
 				signal,
 			});
 		} catch (error) {
-			if (isStreamDropError(error) && attempt < maxRetries && !signal?.aborted) {
+			if (isStreamDropError(error) && streamDropAttempt < maxRetries && !signal?.aborted) {
 				await emit({
 					type: "stream_retry",
-					attempt: attempt + 1,
+					attempt: streamDropAttempt + 1,
 					maxAttempts: maxRetries,
 					error: error instanceof Error ? error.message : String(error),
 					discardedPartial: clonePartialForDebug(),
 				});
-				await sleep(retryBaseDelay * 2 ** attempt, signal);
-				if (addedPartial) {
-					context.messages.pop();
-					addedPartial = false;
-				}
-				partialMessage = null;
+				await sleep(retryBaseDelay * 2 ** streamDropAttempt, signal);
+				discardPartial();
+				streamDropAttempt++;
 				continue;
 			}
 			const surfacedError = isStreamDropError(error)
@@ -409,6 +448,8 @@ async function streamAssistantResponse(
 
 		let shouldRetry = false;
 		let retryError = "";
+		// Set when the stream completes with a "length" result that warrants a budget escalation.
+		let lengthRetry: { previous: number; next: number } | null = null;
 		try {
 			for await (const event of response) {
 				switch (event.type) {
@@ -444,7 +485,7 @@ async function streamAssistantResponse(
 						const result = await response.result();
 						// Check if this is a stream-drop error that should be retried
 						const isDrop = result.stopReason === "error" && isStreamDropError(result.errorMessage);
-						if (isDrop && attempt < maxRetries && !signal?.aborted) {
+						if (isDrop && streamDropAttempt < maxRetries && !signal?.aborted) {
 							shouldRetry = true;
 							retryError =
 								result.errorMessage ?? "Stream ended without terminal event — connection likely dropped";
@@ -453,16 +494,38 @@ async function streamAssistantResponse(
 							return finalizeMessage(
 								createErrorMessage(new Error("Stream dropped repeatedly — connection likely unstable")),
 							);
+						} else if (result.stopReason === "length") {
+							// The model exhausted its output budget mid-response. Retry with a
+							// larger budget if we have retries left, the budget can still grow,
+							// and we have not been aborted. Otherwise, fail loudly below.
+							//
+							// When no explicit maxTokens was set, the request used the provider
+							// default budget — Math.min(model.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS),
+							// NOT the full model ceiling. Resolving the effective budget to the
+							// real default lets escalation request strictly more, and lets the
+							// ceiling guard correctly distinguish a default request (which can
+							// still grow) from one already at the model ceiling.
+							const effectiveMaxTokens =
+								requestMaxTokens ?? Math.min(config.model.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS);
+							const atCeiling = effectiveMaxTokens >= config.model.maxTokens;
+							if (lengthAttempts < lengthRetries && !atCeiling && !signal?.aborted) {
+								lengthRetry = {
+									previous: effectiveMaxTokens,
+									next: escalateLengthBudget(effectiveMaxTokens),
+								};
+							} else {
+								return finalizeMessage(createLengthExhaustedMessage(lengthAttempts + 1));
+							}
 						} else {
 							return finalizeMessage(result);
 						}
 						break;
 					}
 				}
-				if (shouldRetry) break;
+				if (shouldRetry || lengthRetry) break;
 			}
 		} catch (error) {
-			if (isStreamDropError(error) && attempt < maxRetries && !signal?.aborted) {
+			if (isStreamDropError(error) && streamDropAttempt < maxRetries && !signal?.aborted) {
 				shouldRetry = true;
 				retryError = error instanceof Error ? error.message : String(error);
 			} else {
@@ -475,27 +538,39 @@ async function streamAssistantResponse(
 			}
 		}
 
+		if (lengthRetry) {
+			await emit({
+				type: "length_retry",
+				attempt: lengthAttempts + 1,
+				maxAttempts: lengthRetries,
+				previousMaxTokens: lengthRetry.previous,
+				nextMaxTokens: lengthRetry.next,
+				discardedPartial: clonePartialForDebug(),
+			});
+			discardPartial();
+			requestMaxTokens = lengthRetry.next;
+			lengthAttempts++;
+			// A length retry is a fresh request; reset the stream-drop counter.
+			streamDropAttempt = 0;
+			continue;
+		}
+
 		if (shouldRetry) {
 			await emit({
 				type: "stream_retry",
-				attempt: attempt + 1,
+				attempt: streamDropAttempt + 1,
 				maxAttempts: maxRetries,
 				error: retryError,
 				discardedPartial: clonePartialForDebug(),
 			});
-			await sleep(retryBaseDelay * 2 ** attempt, signal);
-			if (addedPartial) {
-				context.messages.pop();
-				addedPartial = false;
-			}
-			partialMessage = null;
+			await sleep(retryBaseDelay * 2 ** streamDropAttempt, signal);
+			discardPartial();
+			streamDropAttempt++;
 			continue;
 		}
 
 		return finalizeMessage(await response.result());
 	}
-
-	return finalizeMessage(createErrorMessage(new Error("Stream dropped repeatedly — connection likely unstable")));
 }
 
 interface ToolExecutionResult {

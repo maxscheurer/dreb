@@ -7,10 +7,12 @@
 - Claude Opus 4.7 support: `supportsXhigh()` recognizes `opus-4-7` model IDs, and the Anthropic and Amazon Bedrock providers detect Opus 4.7 for adaptive thinking and `xhigh` → `max` effort mapping. ([#167](https://github.com/aebrer/dreb/issues/167))
 
 - Added `onWarning` callback to `StreamOptions` for non-fatal warnings during streaming (e.g., malformed JSON chunks, SSE parse errors). All providers now forward `onWarning` to `parseStreamingJson` so callers can handle parse failures instead of silently swallowing them. ([#115](https://github.com/aebrer/dreb/issues/115))
+- Exported `DEFAULT_MAX_OUTPUT_TOKENS` (32000) — the default output-token cap `buildBaseOptions` applies when no explicit `maxTokens` is requested (`Math.min(model.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS)`). Previously the magic number was hard-coded inline; consumers (e.g. `@dreb/agent`'s length-retry guard) now import this constant to reason correctly about the real budget a default request uses, instead of re-hard-coding it.
 - Added `onWarning` callback parameter to `parseStreamingJson()` — called when both `JSON.parse` and `partial-json` fail on input
 
 ### Changed
 
+- Raised the Anthropic provider's default `max_tokens` from `model.maxTokens / 3` to the model's full output ceiling (`model.maxTokens`) when no explicit `maxTokens` is supplied. The previous one-third default, combined with extended thinking, could let the thinking budget consume the entire allowance before any visible text was produced — truncating responses (`StopReason "length"`) to a thinking block with no answer. The budget-based thinking path now also caps `budget_tokens` so it stays strictly below `max_tokens` with reserved text headroom (at least 1/4 of `max_tokens`, floor 4096 tokens), guaranteeing room for the actual answer alongside a large thinking budget. A final clamp ensures `budget_tokens < max_tokens` holds even when `max_tokens <= 1024` (e.g. a caller passing a tiny explicit `maxTokens` with thinking enabled), where the 1024-token thinking floor would otherwise produce `budget_tokens == max_tokens` and trigger an API rejection.
 - Changed direct `minimax` and `minimax-cn` model catalogs to keep only `MiniMax-M2.7` and `MiniMax-M2.7-highspeed`, and updated MiniMax and abort coverage to current provider model IDs and usage behavior ([#2596](https://github.com/badlogic/pi-mono/pull/2596) by [@liyuan97](https://github.com/liyuan97))
 
 ### Fixed
