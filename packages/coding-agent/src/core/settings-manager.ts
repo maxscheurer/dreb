@@ -107,6 +107,12 @@ export interface Settings {
 	dream?: {
 		archivePath?: string; // Custom archive location for dream backups (default: ~/.dreb/memory-archive/)
 	};
+	tabTitle?: TabTitleSettings;
+}
+
+export interface TabTitleSettings {
+	enabled?: boolean; // default: true — auto-generate terminal tab title from session task
+	triggerAfter?: number; // default: 3 — number of tool calls before generating title
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -1005,5 +1011,9 @@ export class SettingsManager {
 			this.markModified("agentModels", "models");
 			this.save();
 		}
+	}
+
+	getTabTitleSettings(): TabTitleSettings | undefined {
+		return this.settings.tabTitle;
 	}
 }

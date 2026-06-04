@@ -258,6 +258,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			}
 			const anthropicStream = client.messages.stream({ ...params, stream: true }, { signal: options?.signal });
 			stream.push({ type: "start", partial: output });
+			let receivedMessageDelta = false;
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
@@ -394,6 +395,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						}
 					}
 				} else if (event.type === "message_delta") {
+					receivedMessageDelta = true;
 					if (event.delta.stop_reason) {
 						output.stopReason = mapStopReason(event.delta.stop_reason);
 					}
@@ -422,6 +424,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				throw new Error("Request was aborted");
 			}
 
+			if (!receivedMessageDelta) {
+				throw new Error("Stream ended without message_delta — connection likely dropped");
+			}
+
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				throw new Error("An unknown error occurred");
 			}
@@ -444,14 +450,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
  * Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+)
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
-	return (
-		modelId.includes("opus-4-6") ||
-		modelId.includes("opus-4.6") ||
-		modelId.includes("opus-4-7") ||
-		modelId.includes("opus-4.7") ||
-		modelId.includes("sonnet-4-6") ||
-		modelId.includes("sonnet-4.6")
-	);
+	return isModelVersionAtLeast(modelId, "opus", 6) || isModelVersionAtLeast(modelId, "sonnet", 6);
+}
+
+/** Check if a modelId contains `{family}-4-N` or `{family}-4.N` where N >= minVersion (1-2 digit minor version only, not date suffixes) */
+function isModelVersionAtLeast(modelId: string, family: string, minVersion: number): boolean {
+	const re = new RegExp(`${family}-4[.-](\\d{1,2})(?!\\d)`);
+	const match = modelId.match(re);
+	return match != null && Number.parseInt(match[1], 10) >= minVersion;
 }
 
 /**
@@ -469,12 +475,7 @@ function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"], model
 		case "high":
 			return "high";
 		case "xhigh": {
-			const isOpus =
-				modelId.includes("opus-4-6") ||
-				modelId.includes("opus-4.6") ||
-				modelId.includes("opus-4-7") ||
-				modelId.includes("opus-4.7");
-			return isOpus ? "max" : "high";
+			return isModelVersionAtLeast(modelId, "opus", 6) ? "max" : "high";
 		}
 		default:
 			return "high";
@@ -651,10 +652,19 @@ function buildParams(
 	options?: AnthropicOptions,
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model.baseUrl, options?.cacheRetention);
+	// Default to the model's full output ceiling when the caller doesn't pass an
+	// explicit limit. This previously defaulted to model.maxTokens / 3, which —
+	// combined with extended thinking — could let the thinking budget consume the
+	// entire allowance before any visible text was produced, truncating the
+	// response (StopReason "length") with a thinking block but no answer. Using
+	// the full maxTokens (the model's max OUTPUT tokens) leaves clear headroom for
+	// text alongside a large thinking budget. The thinking-budget guard below
+	// ensures budget_tokens stays strictly below max_tokens.
+	const maxTokens = options?.maxTokens || model.maxTokens;
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
-		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
+		max_tokens: maxTokens,
 		stream: true,
 	};
 
@@ -705,10 +715,35 @@ function buildParams(
 					params.output_config = { effort: options.effort };
 				}
 			} else {
-				// Budget-based thinking for older models
+				// Budget-based thinking for older models.
+				//
+				// The Anthropic API requires max_tokens > budget_tokens (max_tokens
+				// must accommodate BOTH thinking and visible output). Now that
+				// max_tokens defaults to the model's full ceiling, we additionally
+				// reserve headroom so the model can always produce text alongside a
+				// large thinking budget. Without this guard, a caller-supplied
+				// thinkingBudgetTokens at or above max_tokens would either be rejected
+				// by the API or consume the entire allowance and truncate the answer to
+				// an empty/thinking-only reply.
+				//
+				// Cap the thinking budget so at least 1/4 of max_tokens (with a fixed
+				// floor of 4096 tokens) remains for output, while never dropping below
+				// the API's 1024-token minimum thinking budget.
+				const requestedBudget = options.thinkingBudgetTokens || 1024;
+				const textHeadroom = Math.max(4096, Math.floor(maxTokens / 4));
+				const budgetCeiling = Math.max(1024, maxTokens - textHeadroom);
+				// Final guard for the strict invariant budget_tokens < max_tokens. When
+				// max_tokens <= 1024 (e.g. a caller passing a tiny explicit maxTokens with
+				// thinking enabled), the 1024 floor above would otherwise produce
+				// budget_tokens == max_tokens, which the API rejects. Clamp to
+				// max_tokens - 1 so the request is always structurally valid; such a tiny
+				// budget still can't yield a useful response, but the failure mode becomes
+				// a clear "thinking budget below minimum" rather than an opaque
+				// budget_tokens >= max_tokens rejection.
+				const budget = Math.min(requestedBudget, budgetCeiling, maxTokens - 1);
 				params.thinking = {
 					type: "enabled",
-					budget_tokens: options.thinkingBudgetTokens || 1024,
+					budget_tokens: budget,
 				};
 			}
 		} else if (options?.thinkingEnabled === false) {

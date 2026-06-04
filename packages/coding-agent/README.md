@@ -23,6 +23,7 @@ What you get in exchange: a skill system, an extension API, custom agent definit
 - [Sessions](#sessions)
   - [Branching](#branching)
   - [Compaction](#compaction)
+  - [Tab Title](#tab-title)
 - [Settings](#settings)
 - [Context Files](#context-files)
 - [Memory](#memory)
@@ -64,7 +65,7 @@ Or use a custom provider (corporate proxy, Bedrock, etc.) — see [Custom provid
 
 Then just talk to dreb. All 11 built-in tools are enabled by default: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `subagent`, and `wait`. Use `--tools` to restrict to a subset (e.g., `--tools read,grep,find,ls` for read-only). Three additional tools — `search`, `skill`, and `tasks_update` — are always active regardless of `--tools`. `suggest_next` is active by default but excluded when `--tools` is specified. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [packages](#packages).
 
-**Also available:** [`@dreb/telegram`](https://www.npmjs.com/package/@dreb/telegram) — run dreb as a Telegram bot (`npm install -g @dreb/telegram`).
+**Also available:** [`@dreb/telegram`](https://www.npmjs.com/package/@dreb/telegram) — run dreb as a Telegram bot with live tool status and visible results for user-facing tools (`npm install -g @dreb/telegram`).
 
 **Platform notes:** [Windows](docs/windows.md) | [Termux (Android)](docs/termux.md) | [tmux](docs/tmux.md) | [Terminal setup](docs/terminal-setup.md) | [Shell aliases](docs/shell-aliases.md)
 
@@ -164,7 +165,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from the current branch |
 | `/compact [prompt]` | Manually compact context, optional custom instructions |
-| `/copy` | Copy last assistant message to clipboard |
+| `/copy` | Open multi-select message picker to copy any messages to clipboard |
 | `/dream` | Consolidate and prune memories — backs up, merges duplicates, scans sessions for patterns |
 | `/export [file]` | Export session to HTML file |
 | `/buddy` | Terminal companion — hatch, pet, reroll, set model, or hide. See [docs/buddy.md](docs/buddy.md) |
@@ -244,6 +245,16 @@ Long sessions can exhaust context windows. Compaction summarizes older messages 
 **Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
 
 Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
+
+### Tab Title
+
+After a few tool calls, dreb auto-generates a short terminal tab title describing the session's task. Useful when multiple tabs are open. Fires once per session via a background LLM call; failures are silent.
+
+Disable or adjust the trigger threshold in [settings](docs/settings.md):
+
+```json
+{ "tabTitle": { "enabled": false } }
+```
 
 ---
 
@@ -587,10 +598,9 @@ cat README.md | dreb -p "Summarize this text"
 | `--tools <list>` | Comma-separated list of tools to enable (default: all) |
 | `--no-tools` | Disable all built-in tools (extension tools still work) |
 
-Available built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `subagent`, `wait`
+Available built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `subagent`, `wait`, `search`
 
-Four additional tools are always active but don't appear in `--tools`:
-- `search` — [semantic codebase search](#semantic-search) using natural language queries
+Three additional tools are always active but don't appear in `--tools`:
 - `skill` — invokes [skills](#skills) programmatically
 - `tasks_update` — session [task tracking](#task-tracking) with TUI panel
 - `suggest_next` — suggests a next command shown as ghost text (Tab to accept)

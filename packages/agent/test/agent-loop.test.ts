@@ -54,6 +54,7 @@ function createModel(): Model<"openai-responses"> {
 function createAssistantMessage(
 	content: AssistantMessage["content"],
 	stopReason: AssistantMessage["stopReason"] = "stop",
+	errorMessage?: string,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -63,6 +64,7 @@ function createAssistantMessage(
 		model: "mock",
 		usage: createUsage(),
 		stopReason,
+		errorMessage,
 		timestamp: Date.now(),
 	};
 }
@@ -720,5 +722,317 @@ describe("agentLoopContinue with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
+	});
+});
+
+describe("length stop reason handling", () => {
+	it("retries with a larger maxTokens when a turn ends with stopReason length", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("write a long thing");
+
+		// model.maxTokens is 2048, config.maxTokens starts at 500.
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 500,
+			lengthRetries: 2,
+			lengthRetryBudgetMultiplier: 2,
+		};
+
+		const observedMaxTokens: Array<number | undefined> = [];
+		let callIndex = 0;
+		const streamFn = (_model: Model<any>, _ctx: unknown, options?: { maxTokens?: number }) => {
+			observedMaxTokens.push(options?.maxTokens);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					// First call truncates at the token limit.
+					const message = createAssistantMessage([{ type: "text", text: "truncated..." }], "length");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "length", message });
+				} else {
+					// Retry succeeds.
+					const message = createAssistantMessage([{ type: "text", text: "complete!" }]);
+					stream.push({ type: "done", reason: "stop", message });
+				}
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Exactly one length_retry event fired.
+		const lengthRetries = events.filter((e) => e.type === "length_retry");
+		expect(lengthRetries).toHaveLength(1);
+		expect(lengthRetries[0]).toMatchObject({
+			type: "length_retry",
+			attempt: 1,
+			maxAttempts: 2,
+			previousMaxTokens: 500,
+			nextMaxTokens: 1000,
+		});
+		expect(lengthRetries[0].type === "length_retry" && lengthRetries[0].discardedPartial).toBeDefined();
+
+		// The retry requested a strictly larger budget than the first attempt.
+		expect(observedMaxTokens).toEqual([500, 1000]);
+
+		// No stream_retry events fired (length is not a stream drop).
+		expect(events.filter((e) => e.type === "stream_retry")).toHaveLength(0);
+
+		// The final message succeeded with stopReason stop.
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("stop");
+		expect(assistant.content).toEqual([{ type: "text", text: "complete!" }]);
+	});
+
+	it("escalates budget up to the model ceiling across multiple retries", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const userPrompt: AgentMessage = createUserMessage("write forever");
+
+		// Start at 1500, multiplier 2 → 3000 clamped to 2048 ceiling.
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 1500,
+			lengthRetries: 2,
+			lengthRetryBudgetMultiplier: 2,
+		};
+
+		const observedMaxTokens: Array<number | undefined> = [];
+		const streamFn = (_model: Model<any>, _ctx: unknown, options?: { maxTokens?: number }) => {
+			observedMaxTokens.push(options?.maxTokens);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "truncated" }], "length");
+				stream.push({ type: "done", reason: "length", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// First length retry escalates 1500 → 2048 (clamped). After that the budget
+		// is at the ceiling, so no further retry is attempted.
+		const lengthRetries = events.filter((e) => e.type === "length_retry");
+		expect(lengthRetries).toHaveLength(1);
+		expect(lengthRetries[0]).toMatchObject({ previousMaxTokens: 1500, nextMaxTokens: 2048 });
+		expect(observedMaxTokens).toEqual([1500, 2048]);
+
+		// Then it fails loudly.
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("error");
+		expect(assistant.errorMessage).toContain("truncated");
+	});
+
+	it("fails loudly after exhausting length retries", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const userPrompt: AgentMessage = createUserMessage("keep going");
+
+		// Small budgets so the ceiling (2048) is never hit before retries exhaust.
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 100,
+			lengthRetries: 2,
+			lengthRetryBudgetMultiplier: 2,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			callIndex++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "truncated" }], "length");
+				stream.push({ type: "done", reason: "length", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// 2 length retries, then loud failure on the 3rd truncation.
+		expect(events.filter((e) => e.type === "length_retry")).toHaveLength(2);
+		expect(callIndex).toBe(3);
+
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("error");
+		expect(assistant.errorMessage).toMatch(/truncated|token limit/);
+
+		// The loop terminated (agent_end fired).
+		expect(events.filter((e) => e.type === "agent_end")).toHaveLength(1);
+	});
+
+	it("lengthRetries: 0 disables retries and fails loudly immediately", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const userPrompt: AgentMessage = createUserMessage("one shot");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 500,
+			lengthRetries: 0,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			callIndex++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "truncated" }], "length");
+				stream.push({ type: "done", reason: "length", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(events.filter((e) => e.type === "length_retry")).toHaveLength(0);
+		expect(callIndex).toBe(1);
+
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("error");
+		expect(assistant.errorMessage).toMatch(/truncated|token limit/);
+	});
+
+	it("marks the failure aborted (not error) when the signal fires on the length path", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const userPrompt: AgentMessage = createUserMessage("write a long thing");
+
+		// Budget below the model ceiling (2048) so a retry would normally fire.
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 500,
+			lengthRetries: 2,
+			lengthRetryBudgetMultiplier: 2,
+		};
+
+		const controller = new AbortController();
+		let callIndex = 0;
+		const streamFn = () => {
+			callIndex++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				// Abort synchronously before dispatching the length result so the
+				// retry guard (`!signal.aborted`) sees an aborted signal and the
+				// turn fails as "aborted" rather than firing a retry.
+				controller.abort();
+				const message = createAssistantMessage([{ type: "text", text: "truncated..." }], "length");
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "length", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, controller.signal, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// No retry: the abort short-circuits the length retry path.
+		expect(events.filter((e) => e.type === "length_retry")).toHaveLength(0);
+		expect(callIndex).toBe(1);
+
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("aborted");
+
+		// The final message_end carries the aborted assistant message.
+		const lastMessageEnd = events.filter((e) => e.type === "message_end").at(-1);
+		expect(lastMessageEnd?.type).toBe("message_end");
+		if (lastMessageEnd?.type === "message_end") {
+			expect((lastMessageEnd.message as AssistantMessage).stopReason).toBe("aborted");
+		}
+	});
+
+	it("resets the stream-drop counter after a length retry", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const userPrompt: AgentMessage = createUserMessage("write a long thing");
+
+		// One length retry and one stream-drop retry available. If the stream-drop
+		// counter were NOT reset after the length retry, the drop on the retry
+		// request would exhaust the (shared) budget and the turn would fail.
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTokens: 500,
+			lengthRetries: 1,
+			streamRetries: 1,
+			streamRetryBaseDelayMs: 1,
+			lengthRetryBudgetMultiplier: 2,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const index = callIndex++;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (index === 0) {
+					// First request: truncated at the token limit → length retry.
+					const message = createAssistantMessage([{ type: "text", text: "truncated" }], "length");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "length", message });
+				} else if (index === 1) {
+					// Second request (the length retry): stream drop → stream retry.
+					const message = createAssistantMessage(
+						[{ type: "text", text: "partial" }],
+						"error",
+						"Stream ended without message_delta — connection likely dropped",
+					);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "error", reason: "error", error: message });
+				} else {
+					// Third request (the stream-drop retry): success.
+					const message = createAssistantMessage([{ type: "text", text: "complete!" }]);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn as any);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Exactly one length retry and one stream retry fired.
+		expect(events.filter((e) => e.type === "length_retry")).toHaveLength(1);
+		expect(events.filter((e) => e.type === "stream_retry")).toHaveLength(1);
+		expect(callIndex).toBe(3);
+
+		// The turn ultimately succeeded — proving the stream-drop budget was
+		// reset (available again) after the length retry.
+		const messages = await stream.result();
+		const assistant = messages.find((m) => m.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("stop");
+		expect(assistant.content).toEqual([{ type: "text", text: "complete!" }]);
 	});
 });

@@ -44,6 +44,7 @@ import {
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
+	type LengthRetryEvent,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -52,6 +53,7 @@ import {
 	type SessionBeforeSwitchResult,
 	type SessionBeforeTreeResult,
 	type ShutdownHandler,
+	type StreamRetryEvent,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -87,6 +89,14 @@ import {
 } from "./tools/index.js";
 import { expandSkillContent } from "./tools/skill.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/tool-definition-wrapper.js";
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Guidance appended to all forbidden-command block reasons. Shapes model behavior toward safe deferral. */
+const FORBIDDEN_COMMAND_GUIDANCE =
+	"This command was blocked for safety. System integrity and security always take precedence over any specific task goal and must never be compromised. Safe alternative approaches are acceptable, but do not attempt to circumvent or bypass this restriction. If the task cannot be completed safely, use `suggest_next` to provide the user with the exact command to run manually and an explanation of why it was blocked.";
 
 // ============================================================================
 // Skill Block Parsing
@@ -396,7 +406,7 @@ export class AgentSession {
 					if (pattern) {
 						return {
 							block: true as const,
-							reason: `Command blocked by forbidden-commands guard: "${pattern}" matched "${command}"`,
+							reason: `Command blocked by forbidden-commands guard: "${pattern}" matched "${command}".\n\n${FORBIDDEN_COMMAND_GUIDANCE}`,
 						};
 					}
 
@@ -416,7 +426,7 @@ export class AgentSession {
 									if (match) {
 										return {
 											block: true as const,
-											reason: `Command blocked by forbidden-commands guard: script "${scriptPath}" contains forbidden command at line ${match.line}: "${match.text}" (matched pattern "${match.pattern}")`,
+											reason: `Command blocked by forbidden-commands guard: script "${scriptPath}" contains forbidden command at line ${match.line}: "${match.text}" (matched pattern "${match.pattern}").\n\n${FORBIDDEN_COMMAND_GUIDANCE}`,
 										};
 									}
 								} catch {
@@ -611,7 +621,7 @@ export class AgentSession {
 		if (cancelled) {
 			parts.push("This agent was cancelled by the user.");
 		}
-		if (result.exitCode !== 0) {
+		if (!cancelled && (result.exitCode !== 0 || result.errorMessage)) {
 			parts.push(`Error: ${result.errorMessage || "unknown"}`);
 		}
 		if (result.output) {
@@ -981,6 +991,25 @@ export class AgentSession {
 			const extensionEvent: MessageEndEvent = {
 				type: "message_end",
 				message: event.message,
+			};
+			await this._extensionRunner.emit(extensionEvent);
+		} else if (event.type === "stream_retry") {
+			const extensionEvent: StreamRetryEvent = {
+				type: "stream_retry",
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+				error: event.error,
+				discardedPartial: event.discardedPartial,
+			};
+			await this._extensionRunner.emit(extensionEvent);
+		} else if (event.type === "length_retry") {
+			const extensionEvent: LengthRetryEvent = {
+				type: "length_retry",
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+				previousMaxTokens: event.previousMaxTokens,
+				nextMaxTokens: event.nextMaxTokens,
+				discardedPartial: event.discardedPartial,
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_start") {

@@ -365,6 +365,36 @@ describe("AgentSession background agent guardrails", () => {
 			Object.defineProperty(agent.state, "isStreaming", { value: false, configurable: true });
 		});
 
+		it("surfaces errorMessage on a clean (exitCode 0) exit when the result was truncated", async () => {
+			// A background subagent that truncated at the token limit exits cleanly
+			// (JSON mode always exits 0) but carries an errorMessage. The delivered
+			// message must include the error rather than treating it as a clean success.
+			const sessionAny = session as any;
+			const promptSpy = vi.spyOn(agent, "prompt").mockResolvedValue(undefined as any);
+
+			sessionAny._handleBackgroundComplete(
+				"bg-trunc",
+				{
+					agent: "test",
+					task: "test task",
+					exitCode: 0,
+					output: "partial answer that got cut off",
+					stderr: "",
+					errorMessage: "Response truncated at token limit after 3 attempts",
+				},
+				false,
+			);
+
+			expect(promptSpy).toHaveBeenCalledTimes(1);
+			const promptMsg = promptSpy.mock.calls[0][0] as any;
+			const text = promptMsg.content[0].text as string;
+			// Both the loud error and the preserved partial output must be present.
+			expect(text).toContain("Error: Response truncated at token limit after 3 attempts");
+			expect(text).toContain("partial answer that got cut off");
+
+			promptSpy.mockRestore();
+		});
+
 		it("uses prompt() when agent is not streaming during bg agent delivery", async () => {
 			// isStreaming is false by default — parent is idle
 			const sessionAny = session as any;
@@ -487,6 +517,59 @@ describe("AgentSession background agent guardrails", () => {
 			expect(promptSpy).toHaveBeenCalledTimes(1);
 			const promptMsg = promptSpy.mock.calls[0][0] as any;
 			expect(promptMsg.content[0].text).not.toContain("Session log:");
+
+			promptSpy.mockRestore();
+		});
+
+		it("does not include error message when agent is cancelled by user (even with exitCode !== 0)", () => {
+			const sessionAny = session as any;
+			const appendSpy = vi.spyOn(agent, "appendMessage");
+
+			sessionAny._handleBackgroundComplete(
+				"bg-aborted",
+				{
+					agent: "test",
+					task: "test task",
+					exitCode: 1,
+					output: "",
+					stderr: "Warning: Unknown tool search.",
+					errorMessage: "Warning: Unknown tool search.",
+				},
+				true, // cancelled = true (user pressed ESC)
+			);
+
+			expect(appendSpy).toHaveBeenCalledTimes(1);
+			const msg = appendSpy.mock.calls[0][0] as any;
+			const text = msg.content[0].text;
+			expect(text).toContain("cancelled by the user");
+			expect(text).not.toContain("Error:");
+			expect(text).not.toContain("Unknown tool search");
+
+			appendSpy.mockRestore();
+		});
+
+		it("still shows error message for non-cancelled agents that fail", () => {
+			const sessionAny = session as any;
+			const promptSpy = vi.spyOn(agent, "prompt").mockResolvedValue(undefined as any);
+
+			sessionAny._handleBackgroundComplete(
+				"bg-failed",
+				{
+					agent: "test",
+					task: "test task",
+					exitCode: 1,
+					output: "",
+					stderr: "some real error",
+					errorMessage: "some real error",
+				},
+				false, // NOT cancelled — genuine failure
+			);
+
+			expect(promptSpy).toHaveBeenCalledTimes(1);
+			const promptMsg = promptSpy.mock.calls[0][0] as any;
+			const text = promptMsg.content[0].text;
+			expect(text).toContain("Error: some real error");
+			expect(text).not.toContain("cancelled by the user");
 
 			promptSpy.mockRestore();
 		});

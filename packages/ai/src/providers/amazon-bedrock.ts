@@ -167,6 +167,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			const command = new ConverseStreamCommand(commandInput);
 
 			const response = await client.send(command, { abortSignal: options.signal });
+			let receivedMessageStop = false;
 
 			for await (const item of response.stream!) {
 				if (item.messageStart) {
@@ -181,6 +182,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 				} else if (item.contentBlockStop) {
 					handleContentBlockStop(item.contentBlockStop, blocks, output, stream, options?.onWarning);
 				} else if (item.messageStop) {
+					receivedMessageStop = true;
 					output.stopReason = mapStopReason(item.messageStop.stopReason);
 				} else if (item.metadata) {
 					handleMetadata(item.metadata, model, output);
@@ -199,6 +201,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 
 			if (options.signal?.aborted) {
 				throw new Error("Request was aborted");
+			}
+
+			if (!receivedMessageStop) {
+				throw new Error("Stream ended without messageStop — connection likely dropped");
 			}
 
 			if (output.stopReason === "error" || output.stopReason === "aborted") {
@@ -394,14 +400,14 @@ function handleContentBlockStop(
  * Check if the model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+).
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
-	return (
-		modelId.includes("opus-4-6") ||
-		modelId.includes("opus-4.6") ||
-		modelId.includes("opus-4-7") ||
-		modelId.includes("opus-4.7") ||
-		modelId.includes("sonnet-4-6") ||
-		modelId.includes("sonnet-4.6")
-	);
+	return isModelVersionAtLeast(modelId, "opus", 6) || isModelVersionAtLeast(modelId, "sonnet", 6);
+}
+
+/** Check if a modelId contains `{family}-4-N` or `{family}-4.N` where N >= minVersion (1-2 digit minor version only, not date suffixes) */
+function isModelVersionAtLeast(modelId: string, family: string, minVersion: number): boolean {
+	const re = new RegExp(`${family}-4[.-](\\d{1,2})(?!\\d)`);
+	const match = modelId.match(re);
+	return match != null && Number.parseInt(match[1], 10) >= minVersion;
 }
 
 function mapThinkingLevelToEffort(
@@ -417,12 +423,7 @@ function mapThinkingLevelToEffort(
 		case "high":
 			return "high";
 		case "xhigh": {
-			const isOpus =
-				modelId.includes("opus-4-6") ||
-				modelId.includes("opus-4.6") ||
-				modelId.includes("opus-4-7") ||
-				modelId.includes("opus-4.7");
-			return isOpus ? "max" : "high";
+			return isModelVersionAtLeast(modelId, "opus", 6) ? "max" : "high";
 		}
 		default:
 			return "high";

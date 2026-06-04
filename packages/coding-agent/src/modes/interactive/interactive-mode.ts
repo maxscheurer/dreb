@@ -78,6 +78,7 @@ import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/cha
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { extractCopyableText, getMessagePreview, getMessageRoleLabel } from "../../utils/message-text.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
@@ -86,6 +87,7 @@ import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
 import { BuddyComponent } from "./components/buddy-component.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
+import { type CopyMessageItem, CopySelectorComponent } from "./components/copy-selector.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
@@ -107,6 +109,7 @@ import { ToolExecutionComponent } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { TabTitleGenerator } from "./tab-title.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -252,6 +255,9 @@ export class InteractiveMode {
 	// Buddy companion
 	private buddyController: BuddyController;
 	private buddyComponent: BuddyComponent | null = null;
+
+	// Tab title auto-generation
+	private tabTitleGenerator: TabTitleGenerator | undefined = undefined;
 
 	// Convenience accessors
 	private get agent() {
@@ -600,6 +606,9 @@ export class InteractiveMode {
 		// Set terminal title
 		this.updateTerminalTitle();
 
+		// Initialize tab title auto-generation
+		this.initTabTitleGenerator();
+
 		// Subscribe to agent events
 		this.subscribeToAgent();
 
@@ -639,6 +648,24 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Initialize the tab title auto-generator. Sets up a TabTitleGenerator that
+	 * will fire a background LLM call after a threshold of tool calls to produce
+	 * a concise, task-descriptive terminal tab title.
+	 */
+	private initTabTitleGenerator(): void {
+		const settings = this.settingsManager.getTabTitleSettings();
+		if (settings?.enabled === false) return;
+
+		this.tabTitleGenerator = new TabTitleGenerator(settings, {
+			setTitle: (title) => this.ui.terminal.setTitle(title),
+			getMessages: () => this.session.state.messages,
+			getModel: () => this.session.model,
+			getModelRegistry: () => this.session.modelRegistry,
+			getProvider: () => this.session.model?.provider,
+		});
+	}
+
+	/**
 	 * Run the interactive mode. This is the main entry point.
 	 * Initializes the UI, shows warnings, processes initial messages, and starts the interactive loop.
 	 */
@@ -665,6 +692,13 @@ export class InteractiveMode {
 				this.showWarning(warning);
 			}
 		});
+
+		// Warn if running as root
+		if (process.getuid?.() === 0) {
+			this.showWarning(
+				"Running as root (UID 0). The agent has unrestricted system access — all commands execute with full root privileges.",
+			);
+		}
 
 		// Show startup warnings
 		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
@@ -2082,6 +2116,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onAction("app.clipboard.copyMessages", () => this.showCopySelector());
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -2368,6 +2403,12 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					// Defensive: remove stale streaming component if one exists (e.g. missed stream_retry)
+					if (this.streamingComponent) {
+						this.chatContainer.removeChild(this.streamingComponent);
+						this.streamingComponent = undefined;
+						this.streamingMessage = undefined;
+					}
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -2494,15 +2535,21 @@ export class InteractiveMode {
 				}
 				// Buddy context + reaction for tool execution
 				this.buddyController.handleEvent(event);
+				// Tab title auto-generation
+				this.tabTitleGenerator?.onToolEnd();
 				break;
 			}
 
 			case "agent_end":
+				if (this.retryLoader) {
+					this.retryLoader.stop();
+					this.retryLoader = undefined;
+				}
 				if (this.loadingAnimation) {
 					this.loadingAnimation.stop();
 					this.loadingAnimation = undefined;
-					this.statusContainer.clear();
 				}
+				this.statusContainer.clear();
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -2613,6 +2660,72 @@ export class InteractiveMode {
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				}
+				this.ui.requestRender();
+				break;
+			}
+
+			case "stream_retry": {
+				// Remove the ghost streaming component left from the dropped stream
+				if (this.streamingComponent) {
+					this.chatContainer.removeChild(this.streamingComponent);
+					this.streamingComponent = undefined;
+					this.streamingMessage = undefined;
+				}
+				// Clear any pending tool components from the failed partial
+				for (const [, component] of this.pendingTools.entries()) {
+					this.chatContainer.removeChild(component);
+				}
+				this.pendingTools.clear();
+				// Show retry status
+				this.statusContainer.clear();
+				if (this.loadingAnimation) {
+					this.loadingAnimation.stop();
+					this.loadingAnimation = undefined;
+				}
+				if (this.retryLoader) {
+					this.retryLoader.stop();
+					this.retryLoader = undefined;
+				}
+				this.retryLoader = new Loader(
+					this.ui,
+					(spinner) => theme.fg("warning", spinner),
+					(text) => theme.fg("muted", text),
+					`Stream dropped, retrying (${event.attempt}/${event.maxAttempts})... (${keyText("app.interrupt")} to cancel)`,
+				);
+				this.statusContainer.addChild(this.retryLoader);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "length_retry": {
+				// Remove the ghost streaming component left from the truncated stream
+				if (this.streamingComponent) {
+					this.chatContainer.removeChild(this.streamingComponent);
+					this.streamingComponent = undefined;
+					this.streamingMessage = undefined;
+				}
+				// Clear any pending tool components from the truncated partial
+				for (const [, component] of this.pendingTools.entries()) {
+					this.chatContainer.removeChild(component);
+				}
+				this.pendingTools.clear();
+				// Show retry status
+				this.statusContainer.clear();
+				if (this.loadingAnimation) {
+					this.loadingAnimation.stop();
+					this.loadingAnimation = undefined;
+				}
+				if (this.retryLoader) {
+					this.retryLoader.stop();
+					this.retryLoader = undefined;
+				}
+				this.retryLoader = new Loader(
+					this.ui,
+					(spinner) => theme.fg("warning", spinner),
+					(text) => theme.fg("muted", text),
+					`Response truncated, retrying with larger token budget (${event.attempt}/${event.maxAttempts})... (${keyText("app.interrupt")} to cancel)`,
+				);
+				this.statusContainer.addChild(this.retryLoader);
 				this.ui.requestRender();
 				break;
 			}
@@ -4281,18 +4394,81 @@ export class InteractiveMode {
 	}
 
 	private async handleCopyCommand(): Promise<void> {
-		const text = this.session.getLastAssistantText();
-		if (!text) {
-			this.showError("No agent messages to copy yet.");
+		this.showCopySelector();
+	}
+
+	private showCopySelector(): void {
+		const messages = this.session.messages;
+
+		if (messages.length === 0) {
+			this.showStatus("No messages to copy");
 			return;
 		}
 
-		try {
-			await copyToClipboard(text);
-			this.showStatus("Copied last agent message to clipboard");
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
+		// Build items from session messages
+		const items: CopyMessageItem[] = messages.map((msg, index) => ({
+			index,
+			roleLabel: getMessageRoleLabel(msg),
+			preview: getMessagePreview(msg),
+		}));
+
+		// Hide buddy while selector is open to free vertical space
+		const hadBuddy = this.buddyComponent !== null;
+		if (hadBuddy) {
+			this.widgetContainerBelow.clear();
+			this.ui.requestRender();
 		}
+
+		// Calculate max visible items based on terminal height
+		// Reserve lines for: header(4) + borders(2) + spacers(2) + scroll indicator(1) + footer(1) + padding(2) = ~12 lines overhead
+		const terminalRows = this.ui.terminal.rows;
+		const overhead = 12;
+		const maxVisible = Math.max(3, Math.min(15, terminalRows - overhead));
+
+		this.showSelector((done) => {
+			const selector = new CopySelectorComponent(
+				items,
+				async (selectedIndices) => {
+					done();
+					// Restore buddy
+					if (hadBuddy) this.renderWidgets();
+					this.ui.requestRender();
+
+					if (selectedIndices.length === 0) {
+						this.showWarning("No messages selected");
+						return;
+					}
+
+					// Extract text from selected messages in chronological order
+					const selectedTexts = selectedIndices
+						.map((i) => extractCopyableText(messages[i]))
+						.filter((text) => text.length > 0);
+
+					if (selectedTexts.length === 0) {
+						this.showWarning("Selected messages have no copyable text");
+						return;
+					}
+
+					const combined = selectedTexts.join("\n\n---\n\n");
+
+					const result = await copyToClipboard(combined);
+					const count = selectedTexts.length;
+					if (result.method === "osc52") {
+						this.showStatus(`Sent ${count} message${count === 1 ? "" : "s"} to terminal clipboard (OSC 52)`);
+					} else {
+						this.showStatus(`Copied ${count} message${count === 1 ? "" : "s"} to clipboard`);
+					}
+				},
+				() => {
+					done();
+					// Restore buddy
+					if (hadBuddy) this.renderWidgets();
+					this.ui.requestRender();
+				},
+				maxVisible,
+			);
+			return { component: selector, focus: selector.getMessageList() };
+		});
 	}
 
 	private handleNameCommand(text: string): void {

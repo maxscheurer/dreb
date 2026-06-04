@@ -15,7 +15,7 @@ Use dreb if you want a coding agent that can run against direct APIs, coding sub
 - **Optional local companion.** [`/buddy`](packages/coding-agent/docs/buddy.md) hatches an Ollama-powered terminal companion with persistent state, generated personality/backstory, event reactions, idle quips, name-call responses, pet/reroll/stats commands, and a sidebar presence while you work.
 - **Codebase and web understanding.** dreb includes file, grep/find/ls, bash, web search/fetch, task tracking, skill invocation, and semantic `search`. Semantic search uses AST-aware chunks, embeddings, POEM ranking, memory indexing, and also ships as [`@dreb/semantic-search`](packages/semantic-search/) with an MCP server for other harnesses. The semantic search package requires Node.js 22+.
 - **Detailed usage tracking and performance logging.** dreb records per-session token usage, cost, context-window utilization, and rolling tokens-per-second performance in a local JSONL log (`~/.dreb/agent/performance.jsonl`). This data stays on your machine and can be queried via the TUI footer, Telegram `/stats`, or RPC for personal analytics and model comparison.
-- **Safety and reliability primitives.** Recent dreb-specific hardening includes secret output scrubbing, sensitive-file guards, destructive-command guards, resource diagnostics surfaced in-session, warning propagation, rate-limited web search across parallel subagents, and JSON/RPC protocol hardening.
+- **Safety and reliability primitives.** Recent dreb-specific hardening includes secret output scrubbing, sensitive-file guards, destructive-command guards, resource diagnostics surfaced in-session, warning propagation, rate-limited web search across parallel subagents, and JSON/RPC protocol hardening. Dropped provider streams are retried (discarding the partial), and responses truncated at the model's output-token limit are retried with a larger token budget — failing loudly rather than returning a silently empty or truncated result.
 - **Multiple interfaces.** Run dreb as an interactive TUI, print/headless CLI, JSON event stream, RPC process, embedded [SDK](packages/coding-agent/docs/sdk.md), or [Telegram bot](packages/telegram/).
 
 ## Quick Start
@@ -65,7 +65,7 @@ See the full coding-agent docs in [packages/coding-agent](packages/coding-agent/
 
 ### Tools and interaction
 
-dreb ships with 11 built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `subagent`, and `wait`. Three more tools are always active: `search` for semantic codebase search, `skill` for loading workflows, and `tasks_update` for visible task tracking. `suggest_next` (ghost text command suggestions, Tab to accept) is active by default but excluded when `--tools` is specified.
+dreb ships with 12 built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `subagent`, `wait`, and `search` (semantic codebase search). Two more tools are always active: `skill` for loading workflows, and `tasks_update` for visible task tracking. `suggest_next` (ghost text command suggestions, Tab to accept) is active by default but excluded when `--tools` is specified.
 
 Interactive mode adds slash commands such as `/model`, `/settings`, `/resume`, `/tree`, `/fork`, `/compact`, `/dream`, `/buddy`, `/export`, `/reload`, `/hotkeys`, and `/changelog`. The message queue lets you steer a running agent or queue follow-up work without waiting for the current turn to finish.
 
@@ -100,7 +100,7 @@ The same agent runtime powers multiple surfaces:
 - **JSON mode** — event stream for scripts and automation.
 - **RPC mode** — strict [JSONL stdin/stdout protocol](packages/coding-agent/docs/rpc.md) for non-Node clients and custom UIs.
 - **SDK** — import `@dreb/coding-agent` and create agent sessions directly in TypeScript.
-- **Telegram** — `@dreb/telegram` runs dreb as a bot with sessions, model controls, file upload/download, and live tool status.
+- **Telegram** — `@dreb/telegram` runs dreb as a bot with sessions, model controls, file upload/download, live tool status, and visible results for user-facing tools.
 
 ## Design philosophy
 

@@ -48,6 +48,11 @@ function createAssistantMessage(text: string, overrides?: Partial<AssistantMessa
 
 type SessionWithExtensionEmitHook = {
 	_emitExtensionEvent: (event: AgentEvent) => Promise<void>;
+	_extensionRunner?: {
+		hasHandlers: (eventType: string) => boolean;
+		emit: (event: { type: string; [key: string]: unknown }) => Promise<void>;
+		emitBeforeAgentStart: () => Promise<undefined>;
+	};
 };
 
 describe("AgentSession retry", () => {
@@ -197,6 +202,241 @@ describe("AgentSession retry", () => {
 		expect(callCount).toBe(2);
 		expect(events).toEqual(["start:1", "end:success=true"]);
 		expect(session.isRetrying).toBe(false);
+	});
+
+	it("forwards stream_retry events to extensions with the discarded partial", async () => {
+		let callCount = 0;
+		const model = findModel("anthropic", "sonnet")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamRetries: 1,
+			streamRetryBaseDelayMs: 1,
+			streamFn: () => {
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (callCount === 1) {
+						const msg = createAssistantMessage("partial", {
+							stopReason: "error",
+							errorMessage: "Stream ended without message_delta — connection likely dropped",
+						});
+						stream.push({ type: "start", partial: msg });
+						stream.push({ type: "error", reason: "error", error: msg });
+						return;
+					}
+					const msg = createAssistantMessage("Success");
+					stream.push({ type: "start", partial: msg });
+					stream.push({ type: "done", reason: "stop", message: msg });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		const extensionEvents: Array<{ type: string; [key: string]: unknown }> = [];
+		const sessionWithRunner = session as unknown as SessionWithExtensionEmitHook;
+		sessionWithRunner._extensionRunner = {
+			hasHandlers: () => false,
+			emit: async (event) => {
+				extensionEvents.push(event);
+			},
+			emitBeforeAgentStart: async () => undefined,
+		};
+
+		await session.prompt("Test");
+
+		expect(callCount).toBe(2);
+		expect(extensionEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"turn_start",
+			"message_start",
+			"message_end",
+			"message_start",
+			"stream_retry",
+			"message_start",
+			"message_end",
+			"turn_end",
+			"agent_end",
+		]);
+		const streamRetry = extensionEvents.find((event) => event.type === "stream_retry");
+		expect(streamRetry).toMatchObject({
+			type: "stream_retry",
+			attempt: 1,
+			maxAttempts: 1,
+			error: "Stream ended without message_delta — connection likely dropped",
+			discardedPartial: { content: [{ type: "text", text: "partial" }] },
+		});
+	});
+
+	it("forwards length_retry events to extensions with correct field mapping and discarded partial", async () => {
+		// Positive path: the request uses the provider default budget (32000 for
+		// sonnet, below its 64000 ceiling). The first call truncates with
+		// stopReason "length", so a retry fires escalating 32000 → 64000; the
+		// second call succeeds. This drives the _handleEvents length_retry branch
+		// that forwards all 5 fields to the extension runner.
+		let callCount = 0;
+		const model = findModel("anthropic", "sonnet")!;
+		// Guard the expected numbers against future model changes.
+		expect(model.maxTokens).toBe(64000);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			lengthRetries: 1,
+			streamFn: () => {
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (callCount === 1) {
+						const msg = createAssistantMessage("partial", { stopReason: "length" });
+						stream.push({ type: "start", partial: msg });
+						stream.push({ type: "done", reason: "length", message: msg });
+						return;
+					}
+					const msg = createAssistantMessage("Success");
+					stream.push({ type: "start", partial: msg });
+					stream.push({ type: "done", reason: "stop", message: msg });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		// Disable session-level auto-retry for determinism.
+		settingsManager.applyOverrides({ retry: { enabled: false } });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		const extensionEvents: Array<{ type: string; [key: string]: unknown }> = [];
+		const sessionWithRunner = session as unknown as SessionWithExtensionEmitHook;
+		sessionWithRunner._extensionRunner = {
+			hasHandlers: () => false,
+			emit: async (event) => {
+				extensionEvents.push(event);
+			},
+			emitBeforeAgentStart: async () => undefined,
+		};
+
+		await session.prompt("Test");
+
+		expect(callCount).toBe(2);
+		const lengthRetries = extensionEvents.filter((event) => event.type === "length_retry");
+		expect(lengthRetries).toHaveLength(1);
+		expect(lengthRetries[0]).toMatchObject({
+			type: "length_retry",
+			attempt: 1,
+			maxAttempts: 1,
+			previousMaxTokens: 32000,
+			nextMaxTokens: 64000,
+			discardedPartial: { content: [{ type: "text", text: "partial" }] },
+		});
+
+		// The retry succeeded — the turn ends without an error.
+		const messageEnd = extensionEvents.findLast((event) => event.type === "message_end") as
+			| { message: AssistantMessage }
+			| undefined;
+		expect(messageEnd).toBeDefined();
+		expect((messageEnd?.message as AssistantMessage).stopReason).toBe("stop");
+	});
+
+	it("retries on length truncation from the provider default budget, then fails loudly at the model ceiling", async () => {
+		// The Agent API does not expose a maxTokens option, so the loop's
+		// requestMaxTokens is undefined. The provider sends the default budget —
+		// Math.min(model.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS) = 32000 for sonnet —
+		// NOT the model ceiling. So a "length" truncation can still escalate: the
+		// first retry bumps 32000 → 64000 (sonnet's ceiling); a second truncation
+		// at the ceiling then fails loudly.
+		let callCount = 0;
+		const model = findModel("anthropic", "sonnet")!;
+		// Guard the expected numbers against future model changes.
+		expect(model.maxTokens).toBe(64000);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			lengthRetries: 2,
+			streamFn: () => {
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					// The model truncates at the token limit on every attempt.
+					const msg = createAssistantMessage("partial", { stopReason: "length" });
+					stream.push({ type: "start", partial: msg });
+					stream.push({ type: "done", reason: "length", message: msg });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		// Disable session-level auto-retry so the truncation surfaces directly.
+		settingsManager.applyOverrides({ retry: { enabled: false } });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		const extensionEvents: Array<{ type: string; [key: string]: unknown }> = [];
+		const sessionWithRunner = session as unknown as SessionWithExtensionEmitHook;
+		sessionWithRunner._extensionRunner = {
+			hasHandlers: () => false,
+			emit: async (event) => {
+				extensionEvents.push(event);
+			},
+			emitBeforeAgentStart: async () => undefined,
+		};
+
+		await session.prompt("Test");
+
+		// One retry: attempt 1 at the 32000 default budget escalates to 64000,
+		// then attempt 2 at the ceiling fails loudly. Exactly one length_retry
+		// event is emitted, escalating 32000 → 64000.
+		expect(callCount).toBe(2);
+		const lengthRetries = extensionEvents.filter((event) => event.type === "length_retry");
+		expect(lengthRetries).toHaveLength(1);
+		expect(lengthRetries[0]).toMatchObject({
+			previousMaxTokens: 32000,
+			nextMaxTokens: 64000,
+		});
+
+		// The turn fails loudly with a truncation error.
+		const messageEnd = extensionEvents.findLast((event) => event.type === "message_end") as
+			| { message: AssistantMessage }
+			| undefined;
+		expect(messageEnd).toBeDefined();
+		const assistant = messageEnd?.message as AssistantMessage;
+		expect(assistant.stopReason).toBe("error");
+		expect(assistant.errorMessage).toMatch(/truncated|token limit/);
 	});
 
 	it("exhausts max retries and emits failure", async () => {

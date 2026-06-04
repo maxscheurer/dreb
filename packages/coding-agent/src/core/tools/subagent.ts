@@ -380,6 +380,13 @@ async function spawnSubagent(
 			}
 			const output = outputParts.join("\n\n");
 
+			// Inspect the final assistant message's stopReason to detect truncation
+			// ("length") or a loud truncation failure ("error") from the core agent loop.
+			// stopReason is present at runtime even though collectedMessages is loosely typed.
+			const lastMsg = collectedMessages.length > 0 ? collectedMessages[collectedMessages.length - 1] : undefined;
+			const lastStopReason = lastMsg ? (lastMsg as any).stopReason : undefined;
+			const lastErrorMessage = lastMsg ? (lastMsg as any).errorMessage : undefined;
+
 			// Build error message from best available source: stderr, plain stdout lines, or generic
 			let errorMessage: string | null = null;
 			if (exitCode !== 0) {
@@ -387,6 +394,24 @@ async function spawnSubagent(
 				const plainOutput = plainStdoutLines.join("\n").trim();
 				errorMessage =
 					stderrTrimmed.slice(0, 500) || plainOutput.slice(0, 500) || `Subagent exited with code ${exitCode}`;
+			} else if (output.trim() === "") {
+				// Clean exit but no output — surface why instead of returning a silent empty result.
+				if (lastStopReason === "length") {
+					errorMessage = "Subagent response was truncated at the model's token limit before producing any output.";
+				} else if (lastStopReason === "error" && lastErrorMessage) {
+					errorMessage = String(lastErrorMessage).slice(0, 500);
+				} else {
+					errorMessage = "Subagent completed with no output.";
+				}
+			} else if (lastStopReason === "length") {
+				// Clean exit with partial output — keep the output but make the truncation loud.
+				errorMessage = "Subagent response was truncated at the model's token limit; output may be incomplete.";
+			} else if (lastStopReason === "error" && lastErrorMessage) {
+				// Clean exit with partial output but a loud failure (e.g. length retries
+				// exhausted → the core agent loop converts the truncation to stopReason
+				// "error" while preserving the partial text). Surface the error instead of
+				// letting the partial output masquerade as a clean success.
+				errorMessage = String(lastErrorMessage).slice(0, 500);
 			}
 
 			// Discover the session file written by the child process
@@ -673,6 +698,8 @@ export async function resolveModelForSubagentSpawn(
 	registry: ModelRegistry | undefined,
 	parentModel?: string,
 	signal?: AbortSignal,
+	/** Optional log prefix for warning messages (defaults to "[subagent]") */
+	logPrefix = "[subagent]",
 ): Promise<SubagentModelResolution> {
 	if (signal?.aborted) return { ok: false, error: "Aborted before spawn", skippedModels: [] };
 
@@ -695,7 +722,7 @@ export async function resolveModelForSubagentSpawn(
 			lastError = resolved.error;
 			const reason = compactErrorReason(resolved.error);
 			skippedModels.push({ model: modelStr, reason });
-			log.warn(`[subagent] Model "${modelStr}" unavailable (${reason}). Trying next fallback...`);
+			log.warn(`${logPrefix} Model "${modelStr}" unavailable (${reason}). Trying next fallback...`);
 			continue;
 		}
 
@@ -709,12 +736,12 @@ export async function resolveModelForSubagentSpawn(
 			if (!probe.ok) {
 				lastError = probe.reason;
 				skippedModels.push({ model: modelStr, reason: probe.reason });
-				log.warn(`[subagent] Model "${modelStr}" failed probe (${probe.reason}). Trying next fallback...`);
+				log.warn(`${logPrefix} Model "${modelStr}" failed probe (${probe.reason}). Trying next fallback...`);
 				continue;
 			}
 		}
 
-		log.debug(`[subagent] Using model "${resolved.modelId}" for subagent.`);
+		log.debug(`${logPrefix} Using model "${resolved.modelId}".`);
 		return { ...resolved, skippedModels };
 	}
 
@@ -724,7 +751,7 @@ export async function resolveModelForSubagentSpawn(
 		const parentResolved = resolveModelStringSingle(parentModel, parentProvider, registry);
 		if (parentResolved.ok) {
 			const warning = `Agent preferred models were unavailable. Falling back to parent model "${parentResolved.modelId}".`;
-			log.warn(`[subagent] ${warning}`);
+			log.warn(`${logPrefix} ${warning}`);
 			return { ...parentResolved, warning, skippedModels };
 		}
 		lastError = parentResolved.error;
@@ -791,14 +818,15 @@ function bgRelease(): void {
 }
 
 /**
- * Resolve a per-task cwd relative to the parent cwd.
- * Rejects absolute paths and relative paths that escape the parent directory.
+ * Resolve a per-task cwd.
+ * Accepts absolute paths as-is. Resolves relative paths against the parent cwd,
+ * rejecting any that escape outside it.
  * Returns a result object with ok=false and an error string on rejection, so callers can surface it to the model.
  */
 function clampCwd(defaultCwd: string, itemCwd?: string): { ok: true; cwd: string } | { ok: false; error: string } {
 	if (!itemCwd) return { ok: true, cwd: defaultCwd };
 	if (itemCwd.startsWith("/")) {
-		return { ok: false, error: `Rejected absolute cwd "${itemCwd}" — must be relative to parent cwd` };
+		return { ok: true, cwd: itemCwd };
 	}
 	const resolved = resolve(defaultCwd, itemCwd);
 	if (resolved !== defaultCwd && !resolved.startsWith(`${defaultCwd}/`)) {
@@ -1045,7 +1073,12 @@ export interface SubagentToolOptions {
 const taskItemSchema = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Agent type name (default: 'Explore')" })),
 	task: Type.String({ description: "The task prompt for this subagent" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory (defaults to parent's cwd)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory (defaults to parent's cwd). Accepts absolute paths or relative paths within parent's cwd.",
+		}),
+	),
 	model: Type.Optional(
 		Type.String({
 			description:
@@ -1167,17 +1200,20 @@ function formatSubagentResult(
 	return text;
 }
 
-function formatSingleResult(result: SubagentResult): string {
+export function formatSingleResult(result: SubagentResult): string {
 	let text = `## Agent: ${result.agent}${result.model ? ` (model: ${result.model})` : ""}\n`;
 	if (result.exitCode !== 0) {
 		text += `**Error** (exit ${result.exitCode}): ${result.errorMessage || "Unknown error"}\n`;
 		if (result.stderr) {
 			text += `\nStderr:\n${result.stderr}\n`;
 		}
+	} else if (result.errorMessage) {
+		// Clean exit but an error was surfaced (e.g. truncation at the token limit).
+		text += `**Error**: ${result.errorMessage}\n`;
 	}
 	if (result.output) {
 		text += `\n${result.output}`;
-	} else if (result.exitCode === 0) {
+	} else if (result.exitCode === 0 && !result.errorMessage) {
 		text += "\n(No output)";
 	}
 	if (result.sessionFile) {

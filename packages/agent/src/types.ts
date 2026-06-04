@@ -202,6 +202,42 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	shouldContinue?: () => boolean;
 
 	/**
+	 * Maximum number of times to retry when a stream drops mid-response.
+	 * Retries only trigger on detected stream-drop errors (connection dropped before
+	 * the provider sent its terminal completion event). Other errors are not retried.
+	 *
+	 * Default: 3
+	 */
+	streamRetries?: number;
+
+	/**
+	 * Base delay in milliseconds for exponential backoff between stream retries.
+	 * Actual delay is `baseDelay * 2^attempt` (e.g., 1000, 2000, 4000).
+	 *
+	 * Default: 1000
+	 */
+	streamRetryBaseDelayMs?: number;
+
+	/**
+	 * Maximum number of times to retry when a turn ends with stopReason "length"
+	 * (the model exhausted its output token budget mid-response). Each retry
+	 * discards the truncated partial and re-issues the request with an escalated
+	 * `maxTokens` budget. This is SEPARATE from `streamRetries`.
+	 *
+	 * Default: 2
+	 */
+	lengthRetries?: number;
+
+	/**
+	 * Factor by which to multiply `maxTokens` on each length retry, clamped to the
+	 * model's output ceiling (`model.maxTokens`). Each retry requests a strictly
+	 * larger budget than the previous attempt.
+	 *
+	 * Default: 2
+	 */
+	lengthRetryBudgetMultiplier?: number;
+
+	/**
 	 * Called before a tool is executed, after arguments have been validated.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
@@ -325,4 +361,25 @@ export type AgentEvent =
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean }
+	// Stream reliability
+	| {
+			type: "stream_retry";
+			attempt: number;
+			maxAttempts: number;
+			error: string;
+			/** Partial assistant message discarded before retry, for debugging/instrumentation only. */
+			discardedPartial?: AssistantMessage;
+	  }
+	// Emitted when a turn ends with stopReason "length" and is retried with a larger token budget.
+	| {
+			type: "length_retry";
+			attempt: number;
+			maxAttempts: number;
+			/** The maxTokens budget used for the truncated attempt. */
+			previousMaxTokens: number;
+			/** The escalated maxTokens budget the retry will request. */
+			nextMaxTokens: number;
+			/** Partial assistant message discarded before retry, for debugging/instrumentation only. */
+			discardedPartial?: AssistantMessage;
+	  };

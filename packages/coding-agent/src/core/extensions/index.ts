@@ -81,6 +81,7 @@ export type {
 	InputEventResult,
 	InputSource,
 	KeybindingsManager,
+	LengthRetryEvent,
 	LoadExtensionsResult,
 	LsToolCallEvent,
 	LsToolResultEvent,
@@ -130,6 +131,7 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	StreamRetryEvent,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,
