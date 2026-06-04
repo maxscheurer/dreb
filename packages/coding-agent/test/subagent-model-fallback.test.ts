@@ -1,11 +1,16 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { complete, completeSimple, type Model } from "@dreb/ai";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { ExtensionContext } from "../src/core/extensions/types.js";
 import { log } from "../src/core/logger.js";
 import {
 	type AgentTypeConfig,
+	createSubagentToolDefinition,
 	DEFAULT_MODEL_AVAILABILITY_PROBE_TIMEOUT_MS,
 	executeSingle,
 	formatModelFallbackSummary,
@@ -17,6 +22,7 @@ import {
 	resolveModelForSubagentSpawn,
 	resolveModelStringSingle,
 	resolveModelWithFallbacks,
+	type SubagentResult,
 	subagentToolDefinition,
 } from "../src/core/tools/subagent.js";
 
@@ -1053,6 +1059,128 @@ describe("spawn-time model availability probing", () => {
 	});
 });
 
+/**
+ * Tests for the mach6 settings-based model override precedence in the REAL
+ * executeSingle (issue 219 / PR 220). The precedence under test is:
+ *
+ *   modelOverride  >  agentModels (settings)  >  agent definition config.model
+ *
+ * These tests exercise the actual `const modelSpec = modelOverride || (agentModels...)
+ * || config.model;` line in executeSingle — a typo swapping the operands would fail
+ * here. The spawned model is verified via the CLI args passed to the mocked spawn.
+ */
+describe("executeSingle agentModels precedence (issue 219)", () => {
+	test("agentModels overrides the agent definition model when no modelOverride is given", async () => {
+		// Agent definition prefers "parent-model"; settings override to ["primary-model"].
+		// agentModels is a non-empty array, so the probe path runs — succeed on first probe.
+		vi.mocked(completeSimple).mockResolvedValueOnce(assistantResult("stop"));
+		mockSpawnSubagentResult({ model: "primary-model", output: "agent-models output" });
+
+		const result = await executeSingle(
+			makeAgents("parent-model"),
+			"test-agent",
+			"do work",
+			process.cwd(),
+			undefined,
+			undefined,
+			undefined, // no modelOverride
+			"anthropic",
+			probeRegistry(),
+			undefined,
+			"parent-model",
+			["primary-model"], // agentModels (settings)
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("primary-model");
+		expect(spawnArgs).not.toContain("parent-model");
+		// agentModels is an array → the spawn-time probe path was exercised.
+		expect(completeSimple).toHaveBeenCalledTimes(1);
+	});
+
+	test("modelOverride wins over agentModels", async () => {
+		// modelOverride is a single string → no probe runs at all.
+		mockSpawnSubagentResult({ model: "primary-model", output: "override output" });
+
+		const result = await executeSingle(
+			makeAgents("parent-model"),
+			"test-agent",
+			"do work",
+			process.cwd(),
+			undefined,
+			undefined,
+			"primary-model", // modelOverride (per-invocation)
+			"anthropic",
+			probeRegistry(),
+			undefined,
+			"parent-model",
+			["fallback-model"], // agentModels — should be ignored
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("primary-model");
+		expect(spawnArgs).not.toContain("fallback-model");
+		expect(spawnArgs).not.toContain("parent-model");
+		// Single override string skips probing entirely.
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	test("empty agentModels array falls through to the agent definition model", async () => {
+		mockSpawnSubagentResult({ model: "parent-model", output: "config output" });
+
+		const result = await executeSingle(
+			makeAgents("parent-model"),
+			"test-agent",
+			"do work",
+			process.cwd(),
+			undefined,
+			undefined,
+			undefined, // no modelOverride
+			"anthropic",
+			probeRegistry(),
+			undefined,
+			"primary-model",
+			[], // empty agentModels — must fall through
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("parent-model");
+		// config.model is a single string → no probe runs.
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	test("undefined agentModels falls through to the agent definition model", async () => {
+		mockSpawnSubagentResult({ model: "parent-model", output: "config output" });
+
+		const result = await executeSingle(
+			makeAgents("parent-model"),
+			"test-agent",
+			"do work",
+			process.cwd(),
+			undefined,
+			undefined,
+			undefined, // no modelOverride
+			"anthropic",
+			probeRegistry(),
+			undefined,
+			"primary-model",
+			undefined, // no agentModels
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("parent-model");
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+});
+
 describe("probe uses streamSimple path (issue 215 regression)", () => {
 	test("probe does NOT use low-level complete() — uses completeSimple (streamSimple path)", async () => {
 		// The old implementation used complete() which calls provider.stream() directly.
@@ -1407,5 +1535,197 @@ describe("formatSingleResult", () => {
 		expect(text).toContain("\nhello");
 		expect(text).not.toContain("**Error**");
 		expect(text).not.toContain("(No output)");
+	});
+});
+
+/**
+ * Tool-layer wiring tests for agentModels (issue 219 / PR 220, review finding 4).
+ *
+ * The precedence tests above call `executeSingle` directly with a pre-computed
+ * `string[]` agentModels argument. These tests instead drive the REAL tool created
+ * by `createSubagentToolDefinition`, exercising the wiring that looks up
+ * `getAgentModelsForAgent(agentName)` and forwards the result for both the
+ * background single-agent path and the chain per-step path. The goal is to catch a
+ * wrong lookup key — a typo there would silently target the wrong agent.
+ *
+ * No modelRegistry is passed, so model resolution short-circuits through
+ * `resolveModelWithFallbacks` (no probe), and the resolved model surfaces directly
+ * in the spawned child's `--model` CLI argument.
+ */
+describe("subagent tool agentModels wiring (issue 219, finding 4)", () => {
+	let tmpRoot: string;
+
+	beforeEach(() => {
+		// Build a temp cwd with project-level agent definitions. Project agents are
+		// loaded LAST in discoverAgentTypes, so they override package/user agents,
+		// giving deterministic config.model values for the fall-through assertions.
+		tmpRoot = mkdtempSync(join(tmpdir(), "subagent-wiring-"));
+		const agentsDir = join(tmpRoot, ".dreb", "agents");
+		mkdirSync(agentsDir, { recursive: true });
+		writeFileSync(
+			join(agentsDir, "feature-dev.md"),
+			"---\nname: feature-dev\ndescription: impl agent\nmodel: config/feature-model\n---\nfeature prompt",
+		);
+		writeFileSync(
+			join(agentsDir, "explore.md"),
+			"---\nname: Explore\ndescription: explore agent\nmodel: config/explore-model\n---\nexplore prompt",
+		);
+	});
+
+	afterEach(() => {
+		rmSync(tmpRoot, { recursive: true, force: true });
+	});
+
+	/**
+	 * Build the real tool plus a recording spy for getAgentModelsForAgent that
+	 * returns an override list only for "feature-dev". Returns a `done` promise that
+	 * resolves with the background SubagentResult so tests can await the async
+	 * background lifecycle before asserting on the mocked spawn args.
+	 */
+	function makeTool(getter?: (name: string) => string[] | undefined) {
+		const lookupSpy = vi.fn(getter ?? ((name: string) => (name === "feature-dev" ? ["override/model"] : undefined)));
+		let resolveDone: (r: SubagentResult) => void;
+		const done = new Promise<SubagentResult>((res) => {
+			resolveDone = res;
+		});
+		const tool = createSubagentToolDefinition(tmpRoot, {
+			getAgentModelsForAgent: lookupSpy,
+			onBackgroundComplete: (_id, result) => resolveDone(result),
+			// No modelRegistry / parentProvider: resolution stays registry-less.
+		});
+		return { tool, lookupSpy, done };
+	}
+
+	test("background single agent: override list is looked up by agent name and forwarded to spawn", async () => {
+		mockSpawnSubagentResult({ model: "override/model", output: "ok" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		const res = await tool.execute(
+			"call-1",
+			{ agent: "feature-dev", task: "do work" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(res.content[0]).toMatchObject({ type: "text" });
+		await done;
+
+		// The lookup key MUST be the agent name — a wrong key would miss the override.
+		expect(lookupSpy).toHaveBeenCalledWith("feature-dev");
+		// The override resolved (no registry → returned as-is) and reached the child.
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("override/model");
+		expect(spawnArgs).not.toContain("config/feature-model");
+		// Registry-less resolution skips probing entirely.
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	test("background single agent without override falls through to the agent definition model", async () => {
+		mockSpawnSubagentResult({ model: "config/explore-model", output: "ok" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		// "Explore" is the default agent — the lookup returns undefined for it.
+		await tool.execute(
+			"call-2",
+			{ agent: "Explore", task: "look around" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await done;
+
+		expect(lookupSpy).toHaveBeenCalledWith("Explore");
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("config/explore-model");
+		expect(spawnArgs).not.toContain("override/model");
+	});
+
+	test("background single agent defaults the lookup key to DEFAULT_AGENT when no agent is given", async () => {
+		mockSpawnSubagentResult({ model: "config/explore-model", output: "ok" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		// No `agent` provided → DEFAULT_AGENT ("Explore") is used for both the lookup
+		// key and the spawned agent.
+		await tool.execute("call-3", { task: "look around" }, undefined, undefined, {} as ExtensionContext);
+		await done;
+
+		expect(lookupSpy).toHaveBeenCalledWith("Explore");
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("config/explore-model");
+	});
+
+	test("chain: per-step lookup uses step.agent and forwards the override for that step", async () => {
+		mockSpawnSubagentResult({ model: "override/model", output: "step output" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		await tool.execute(
+			"call-4",
+			{ chain: [{ agent: "feature-dev", task: "implement {previous}" }] },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await done;
+
+		// The per-step lookup MUST use step.agent — not a wrong fallback.
+		expect(lookupSpy).toHaveBeenCalledWith("feature-dev");
+		expect(spawn).toHaveBeenCalledTimes(1);
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("override/model");
+		expect(spawnArgs).not.toContain("config/feature-model");
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	test("chain: a step without an override falls through to that step's agent definition model", async () => {
+		mockSpawnSubagentResult({ model: "config/explore-model", output: "step output" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		await tool.execute(
+			"call-5",
+			{ chain: [{ agent: "Explore", task: "look" }] },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await done;
+
+		expect(lookupSpy).toHaveBeenCalledWith("Explore");
+		const spawnArgs = vi.mocked(spawn).mock.calls[0][1];
+		expect(spawnArgs).toContain("config/explore-model");
+		expect(spawnArgs).not.toContain("override/model");
+	});
+
+	test("chain: each step is looked up by its own agent name (distinct keys)", async () => {
+		// Two-step chain with distinct agents. Step 1 (feature-dev) gets the override;
+		// step 2 (Explore) falls through. Verifies the lookup key tracks step.agent
+		// per-iteration rather than using a single chain-wide value.
+		mockSpawnSubagentResult({ model: "override/model", output: "step 1 output" });
+		mockSpawnSubagentResult({ model: "config/explore-model", output: "step 2 output" });
+		const { tool, lookupSpy, done } = makeTool();
+
+		await tool.execute(
+			"call-6",
+			{
+				chain: [
+					{ agent: "feature-dev", task: "implement" },
+					{ agent: "Explore", task: "review {previous}" },
+				],
+			},
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await done;
+
+		expect(lookupSpy).toHaveBeenCalledWith("feature-dev");
+		expect(lookupSpy).toHaveBeenCalledWith("Explore");
+		expect(spawn).toHaveBeenCalledTimes(2);
+		const step1Args = vi.mocked(spawn).mock.calls[0][1];
+		const step2Args = vi.mocked(spawn).mock.calls[1][1];
+		expect(step1Args).toContain("override/model");
+		expect(step2Args).toContain("config/explore-model");
+		expect(step2Args).not.toContain("override/model");
 	});
 });

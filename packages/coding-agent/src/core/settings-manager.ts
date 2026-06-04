@@ -44,6 +44,10 @@ export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 }
 
+export interface AgentModelsSettings {
+	models?: Record<string, string[]>;
+}
+
 export type TransportSetting = Transport;
 
 /**
@@ -99,6 +103,7 @@ export interface Settings {
 	forbiddenCommands?: string[]; // Regex patterns for commands blocked by the forbidden-commands guard
 	sensitiveFilePaths?: string[]; // Additional glob patterns for sensitive file paths blocked by the read/bash guard
 	secretOutputPatterns?: { name: string; pattern: string }[]; // Additional regex patterns for secret scrubbing in tool output
+	agentModels?: AgentModelsSettings;
 	dream?: {
 		archivePath?: string; // Custom archive location for dream backups (default: ~/.dreb/memory-archive/)
 	};
@@ -977,6 +982,52 @@ export class SettingsManager {
 		this.globalSettings.dream.archivePath = path;
 		this.markModified("dream", "archivePath");
 		this.save();
+	}
+
+	getAgentModels(): Record<string, string[]> {
+		// Merge global + project at the per-agent-name level, with project winning per-key.
+		// Reading directly from globalSettings/projectSettings avoids the wholesale
+		// replacement that deepMergeSettings would do for the shared `models` sub-key.
+		const merged: Record<string, string[]> = {
+			...this.globalSettings.agentModels?.models,
+			...this.projectSettings.agentModels?.models,
+		};
+		// Deep-copy inner arrays so callers can't mutate stored state.
+		return Object.fromEntries(Object.entries(merged).map(([k, v]) => [k, [...v]]));
+	}
+
+	getAgentModelsForAgent(agentName: string): string[] | undefined {
+		const models = this.getAgentModels()[agentName];
+		return models && models.length > 0 ? models : undefined;
+	}
+
+	/**
+	 * Whether a project-level (`.dreb/settings.json`) agentModels entry exists for this agent.
+	 * Project entries win over global ones in {@link getAgentModels}, so a global write/remove
+	 * via the TUI has no effect when this returns true — callers should surface this loudly.
+	 */
+	hasProjectAgentModelOverride(agentName: string): boolean {
+		return this.projectSettings.agentModels?.models?.[agentName] !== undefined;
+	}
+
+	setAgentModelsForAgent(agentName: string, models: string[]): void {
+		if (!this.globalSettings.agentModels) {
+			this.globalSettings.agentModels = {};
+		}
+		if (!this.globalSettings.agentModels.models) {
+			this.globalSettings.agentModels.models = {};
+		}
+		this.globalSettings.agentModels.models[agentName] = [...models];
+		this.markModified("agentModels", "models");
+		this.save();
+	}
+
+	removeAgentModelsForAgent(agentName: string): void {
+		if (this.globalSettings.agentModels?.models?.[agentName] !== undefined) {
+			delete this.globalSettings.agentModels.models[agentName];
+			this.markModified("agentModels", "models");
+			this.save();
+		}
 	}
 
 	getTabTitleSettings(): TabTitleSettings | undefined {
