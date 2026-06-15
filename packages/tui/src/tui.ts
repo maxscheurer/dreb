@@ -1032,8 +1032,10 @@ export class TUI extends Container {
 		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
-		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
-		let prevViewportTop = heightChanged ? Math.max(0, previousBufferLength - height) : this.previousViewportTop;
+		// On resize, derive the prior live-region viewport from live content height,
+		// not the old terminal row count. Blank space in a taller viewport must not be
+		// mistaken for scrolled live content that needs a transcript recommit.
+		let prevViewportTop = heightChanged ? Math.max(0, this.previousLines.length - height) : this.previousViewportTop;
 		let viewportTop = prevViewportTop;
 		let hardwareCursorRow = this.hardwareCursorRow;
 		const computeLineDiff = (targetRow: number): number => {
@@ -1090,6 +1092,32 @@ export class TUI extends Container {
 			this.onPostRender?.();
 		};
 
+		// Choose the correct full-redraw strategy for shrink/viewport-shift paths.
+		//
+		// `fullRender(true)` clears and repaints ONLY the live region (cursor-up +
+		// `\r\x1b[J`). That is correct as long as the live region fit within the
+		// viewport (`prevViewportTop === 0`), because the live-region start is still
+		// on screen and reachable.
+		//
+		// But when the live region had grown taller than the viewport
+		// (`prevViewportTop > 0`), the terminal scrolled and pushed committed history
+		// — and the top of the live region — above the viewport into scrollback.
+		// Cursor-up cannot reach past the viewport top, so `fullRender(true)` would
+		// paint the (now smaller) live region anchored at the TOP of an otherwise
+		// empty viewport, with committed history stranded in scrollback. That is the
+		// "jump to the top" reported in issue 277.
+		//
+		// `recommitAll()` re-emits the committed tail + live region and re-anchors the
+		// editor at the BOTTOM of the viewport, matching the steady-state the
+		// differential renderer leaves on every keystroke.
+		const clearAndRedraw = (): void => {
+			if (prevViewportTop > 0) {
+				this.recommitAll();
+			} else {
+				fullRender(true);
+			}
+		};
+
 		const debugRedraw = process.env.DREB_DEBUG_REDRAW === "1";
 		const logRedraw = (reason: string): void => {
 			if (!debugRedraw) return;
@@ -1115,11 +1143,13 @@ export class TUI extends Container {
 		}
 
 		// Height changes need a full re-render to keep the visible viewport aligned.
-		// With the committed-scrollback model, only the live region is re-rendered,
-		// so this is cheap and safe even on Termux (no transcript replay).
+		// Keep the cheap live-region-only redraw when the live-region start is still
+		// reachable (`prevViewportTop === 0`). If the prior live region exceeded the
+		// viewport, recommit the transcript tail so committed history is restored and
+		// the editor is anchored at the bottom instead of stranded at the top.
 		if (heightChanged) {
 			logRedraw(`terminal height changed (${this.previousHeight} -> ${height})`);
-			fullRender(true);
+			clearAndRedraw();
 			return;
 		}
 
@@ -1164,7 +1194,7 @@ export class TUI extends Container {
 				const targetRow = Math.max(0, newLines.length - 1);
 				if (targetRow < prevViewportTop) {
 					logRedraw(`deleted lines moved viewport up (${targetRow} < ${prevViewportTop})`);
-					fullRender(true);
+					clearAndRedraw();
 					return;
 				}
 				const lineDiff = computeLineDiff(targetRow);
@@ -1179,7 +1209,7 @@ export class TUI extends Container {
 				const extraLines = this.previousLines.length - newLines.length;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
-					fullRender(true);
+					clearAndRedraw();
 					return;
 				}
 				if (extraLines > 0) {
@@ -1234,7 +1264,7 @@ export class TUI extends Container {
 			} else {
 				// Viewport needs to shift — full redraw without scrollback clear
 				logRedraw(`firstChanged < viewportTop with viewport shift (${firstChanged} < ${prevViewportTop})`);
-				fullRender(true);
+				clearAndRedraw();
 				return;
 			}
 		}
