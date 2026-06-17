@@ -880,15 +880,20 @@ async function generateModels() {
 		});
 	}
 
-	const minimaxDirectSupportedIds = new Set(["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]);
+	const minimaxDirectSupportedIds = new Set(["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3"]);
 
 	for (const candidate of allModels) {
 		if (
 			(candidate.provider === "minimax" || candidate.provider === "minimax-cn") &&
 			minimaxDirectSupportedIds.has(candidate.id)
 		) {
-			candidate.contextWindow = 204800;
-			candidate.maxTokens = 131072;
+			if (candidate.id === "MiniMax-M3") {
+				candidate.contextWindow = 1000000;
+				candidate.maxTokens = 512000;
+			} else {
+				candidate.contextWindow = 204800;
+				candidate.maxTokens = 131072;
+			}
 		}
 	}
 

@@ -414,8 +414,8 @@ describe("default model selection", () => {
 	});
 
 	test("minimax and cerebras defaults track current models", () => {
-		expect(defaultModelPerProvider.minimax).toBe("MiniMax-M2.7");
-		expect(defaultModelPerProvider["minimax-cn"]).toBe("MiniMax-M2.7");
+		expect(defaultModelPerProvider.minimax).toBe("MiniMax-M3");
+		expect(defaultModelPerProvider["minimax-cn"]).toBe("MiniMax-M3");
 		expect(defaultModelPerProvider.cerebras).toBe("gpt-oss-120b");
 	});
 
