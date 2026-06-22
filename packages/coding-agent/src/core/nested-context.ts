@@ -1,7 +1,9 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { CONTEXT_FILE_CANDIDATES, loadContextFilesFromDir, type ResourceDiagnostic } from "./resource-loader.js";
+import { renderTerminalOutput } from "./tools/terminal-render.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./tools/truncate.js";
 
 /**
  * Auto-load of nested AGENTS.md/CLAUDE.md context files.
@@ -83,6 +85,20 @@ export function parseLeadingCd(command: string): string | null {
 }
 
 /**
+ * Expand a leading `~` to the home directory and resolve a raw path string to an absolute
+ * path against `baseDir`. Shared by every place that turns a user-supplied path token into
+ * an absolute path (`resolveTargetDir`, `resolveSelfReadFile`, bash argument resolution).
+ */
+function expandToAbsolute(rawPath: string, baseDir: string): string {
+	if (rawPath === "~") {
+		rawPath = homedir();
+	} else if (rawPath.startsWith(`~${sep}`) || rawPath.startsWith("~/")) {
+		rawPath = join(homedir(), rawPath.slice(2));
+	}
+	return isAbsolute(rawPath) ? rawPath : resolve(baseDir, rawPath);
+}
+
+/**
  * Resolve the absolute directory a tool call is about to operate in, or `null` when the
  * tool/argument shape does not identify a directory we should react to.
  */
@@ -106,14 +122,7 @@ export function resolveTargetDir(
 
 	if (!rawPath) return null;
 
-	// Expand a leading `~` to the home directory.
-	if (rawPath === "~") {
-		rawPath = homedir();
-	} else if (rawPath.startsWith(`~${sep}`) || rawPath.startsWith("~/")) {
-		rawPath = join(homedir(), rawPath.slice(2));
-	}
-
-	const absolute = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+	const absolute = expandToAbsolute(rawPath, cwd);
 
 	// For path-bearing tools the argument is usually a file; for bash `cd` it is a
 	// directory. Resolve to a directory: existing dirs are used as-is, everything else
@@ -225,17 +234,31 @@ function dirHasContextFile(dir: string): boolean {
 }
 
 /**
+ * Predicate deciding whether a collected context file should be *suppressed* from the
+ * injected block because the triggering tool call already delivers its content (e.g. a
+ * `read` of the file itself, or a `bash` command that prints it). Suppressed files are
+ * still marked as loaded so they are never injected later — they are simply not
+ * duplicated into the result that already contains them.
+ */
+export type SuppressPredicate = (file: LoadedContextFile) => boolean;
+
+/**
  * Collect nested context files for `targetDir`, walking up to the ceiling described in
  * {@link resolveWalkDirs}. Files whose realpath is already in `alreadyLoaded` are skipped
  * (and not re-reported). Newly collected realpaths are added to `alreadyLoaded` so the
  * caller's per-session set stays authoritative and each file loads at most once. Also
  * reports whether an existing context file failed to read so callers can retry later
  * instead of negatively caching a transient failure.
+ *
+ * When `suppress` matches a newly-seen file, that file is marked loaded but excluded from
+ * the returned `files` — the triggering tool result already contains it, so re-injecting
+ * would duplicate the content and waste tokens.
  */
 export function collectNestedContext(
 	targetDir: string,
 	cwd: string,
 	alreadyLoaded: Set<string>,
+	suppress?: SuppressPredicate,
 ): NestedContextCollection {
 	const dirs = resolveWalkDirs(targetDir, cwd);
 	const collected: LoadedContextFile[] = [];
@@ -254,6 +277,8 @@ export function collectNestedContext(
 			const real = safeRealpath(file.path);
 			if (alreadyLoaded.has(real)) continue;
 			alreadyLoaded.add(real);
+			// Mark loaded but do not inject: the triggering tool already delivers this file.
+			if (suppress?.(file)) continue;
 			collected.push(file);
 		}
 	}
@@ -281,7 +306,140 @@ export function formatNestedContextBlock(targetDir: string, files: LoadedContext
 	return `${header}\n\n${sections.join("\n\n")}`;
 }
 
-/** Mutable per-session state threaded through {@link computeNestedContextBlock}. */
+/**
+ * Resolve the absolute file path a `read` tool call delivers, or `null` when the tool is
+ * not `read` or has no usable `path`. Only `read` returns the *full* file content, so it
+ * is the only path-tool whose result fully duplicates an injected context file. (`grep`
+ * returns matched lines, `ls`/`edit`/`write` do not echo the whole file — those still
+ * benefit from injection.)
+ */
+export function resolveSelfReadFile(
+	toolName: string,
+	args: Record<string, unknown> | undefined,
+	cwd: string,
+): string | null {
+	if (!args || toolName !== "read") return null;
+	// A sliced read (`offset`/`limit`) delivers only a fragment of the file — the same
+	// hazard for which bash partial viewers (`head`/`tail`) are excluded. Treating it as a
+	// full delivery would suppress (and permanently mark loaded) a file the result only
+	// partially contains, silently dropping the rest. Fall back to the safe double-load.
+	if (args.offset !== undefined || args.limit !== undefined) return null;
+	const p = args.path;
+	if (typeof p !== "string" || p.trim() === "") return null;
+	return expandToAbsolute(p, cwd);
+}
+
+/**
+ * Bash commands that dump a file's *full* contents to stdout. Deliberately narrow: only
+ * commands that emit the whole file qualify. Partial viewers (`head`/`tail`) and
+ * interactive pagers (`less`/`more`) are excluded — they may show only a fragment, so
+ * treating them as "delivered" could silently drop the rest of a context file. The safe
+ * failure mode is a harmless double-load (we still inject), never a silent context drop.
+ *
+ * `bat` is included but is *not* unconditionally a full dump: its `-r`/`--line-range` flag
+ * emits only a range (same hazard as `head`/`tail`). Segments carrying that flag are
+ * disqualified in {@link resolveBashDeliveredFiles}.
+ */
+const FULL_DUMP_COMMANDS = new Set(["cat", "bat"]);
+
+/** `bat` flags that limit output to a partial range — disqualify the segment if present. */
+const BAT_RANGE_FLAGS = ["-r", "--line-range"];
+
+/**
+ * Whether a `bat` token requests a partial line range. Matches the space-separated form
+ * (`-r`, `--line-range`), the `=`-attached long form (`--line-range=10:20`), and the
+ * attached short form (`-r10:20`) — clap accepts an attached value on a short flag, so a
+ * bare `startsWith` check on each known range flag covers every spelling. A partial range
+ * is the same hazard as `head`/`tail`: only a fragment is emitted, so the segment must not
+ * be treated as a full dump.
+ */
+function isBatRangeFlag(token: string): boolean {
+	return BAT_RANGE_FLAGS.some((flag) => token.startsWith(flag));
+}
+
+/** Strip a single layer of matching surrounding quotes from a shell token. */
+function unquoteToken(token: string): string {
+	if (token.length >= 2) {
+		const first = token[0];
+		const last = token[token.length - 1];
+		if ((first === '"' || first === "'") && first === last) {
+			return token.slice(1, -1);
+		}
+	}
+	return token;
+}
+
+/**
+ * Resolve the absolute paths of files a bash command fully delivers to stdout via a
+ * full-dump command (`cat`/`bat`). Path arguments are resolved against `workingDir` (the
+ * command's effective cwd — e.g. a leading `cd` target). Conservative on purpose:
+ *
+ *  - Segments are split on `&&`, `||`, `;`. Segments that are *only* a `cd` produce no
+ *    stdout and are ignored, but there must be **exactly one** remaining output-producing
+ *    segment. The bash tool truncates its *combined* command output from the **tail**
+ *    (keeping the last {@link DEFAULT_MAX_LINES} lines / {@link DEFAULT_MAX_BYTES} bytes and
+ *    dropping the head), so any *additional* output-producing segment could evict the dumped
+ *    file from the visible window while {@link deliveredInFull} — which measures the file
+ *    alone — still reports a full delivery. Bail to the safe double-load in that case.
+ *  - That sole segment must not contain a pipe (`|`), output redirection (`>`), or input
+ *    redirection / here-doc / here-string (`<`, `<<`, `<<<`) — its output is filtered /
+ *    redirected, or its operands are stdin body words rather than dumped files.
+ *  - Its first token must be `cat`/`bat`; flags (`-…`) are ignored.
+ *  - A `bat` segment carrying a partial-range flag (`-r`/`--line-range`, any spelling) is
+ *    skipped — it emits only a fragment, like `head`/`tail`.
+ *  - It must have **exactly one** file operand. A multi-file dump (`cat A.md B.md`)
+ *    concatenates several files; under tail truncation an earlier operand can be evicted
+ *    while still appearing fully sized on disk, so it is not a provable full delivery.
+ *  - If the command chains more than one `cd`, the effective cwd is ambiguous (we only
+ *    resolved the *first* `cd`), so operands cannot be resolved reliably — return nothing.
+ *
+ * Anything we cannot confidently classify as a full delivery is omitted, so the worst case
+ * is a double-load rather than a silently dropped context file.
+ */
+export function resolveBashDeliveredFiles(command: string, workingDir: string): string[] {
+	if (typeof command !== "string" || command.trim() === "") return [];
+	const segments = command.split(/&&|\|\||;/);
+	const isCdSegment = (s: string) => /^\s*cd(\s|$)/.test(s);
+
+	// More than one `cd` means the effective cwd differs from the first `cd` target we
+	// resolved as `workingDir`; resolving operands against it would suppress the wrong
+	// (same-named) file. Bail to the safe double-load.
+	if (segments.filter(isCdSegment).length > 1) return [];
+
+	// Segments that are only a `cd` emit no stdout. Everything else produces output, and
+	// because the bash tool tail-truncates the *combined* output, a context file is only
+	// provably delivered in full when it is the command's *sole* output-producing segment.
+	const outputSegments = segments.filter((s) => s.trim() !== "" && !isCdSegment(s));
+	if (outputSegments.length !== 1) return [];
+
+	const segment = outputSegments[0];
+	// Output piped/redirected, or operands fed via input redirection / here-doc, are not raw
+	// file dumps to stdout.
+	if (segment.includes("|") || segment.includes(">") || segment.includes("<")) return [];
+	const tokens = segment.trim().split(/\s+/).filter(Boolean);
+	if (tokens.length === 0) return [];
+	// Match the command verb case-sensitively: shell PATH lookup is case-sensitive on
+	// Linux, so `CAT`/`Bat` are command-not-found and emit nothing to stdout. Lowercasing
+	// would let them match the allowlist and falsely suppress a file they never printed —
+	// a silent context drop. Exact matching keeps the failure mode a harmless double-load.
+	const cmd = tokens[0];
+	if (!FULL_DUMP_COMMANDS.has(cmd)) return [];
+	// `bat -r 10:20` / `bat -r10:20` / `bat --line-range=10:20` shows only a range — not a full dump.
+	if (cmd === "bat" && tokens.slice(1).some(isBatRangeFlag)) return [];
+
+	const operands: string[] = [];
+	for (const token of tokens.slice(1)) {
+		if (token.startsWith("-")) continue; // flag, not a file argument
+		const arg = unquoteToken(token);
+		if (arg === "") continue;
+		operands.push(arg);
+	}
+	// A single operand is the only provable full delivery: multi-file dumps concatenate,
+	// and tail truncation can evict an earlier file while it still looks fully sized.
+	if (operands.length !== 1) return [];
+	return [expandToAbsolute(operands[0], workingDir)];
+}
+
 export interface NestedContextState {
 	/** Whether auto-loading is enabled (the `context.autoLoadNested` setting). */
 	enabled: boolean;
@@ -291,6 +449,38 @@ export interface NestedContextState {
 	loaded: Set<string>;
 	/** Realpaths of directories already scanned (negative cache). Mutated. */
 	scannedDirs: Set<string>;
+}
+
+/**
+ * Whether a tool that delivers `realPath` actually delivers its *full* content. Both `read`
+ * and `bash` truncate their output at {@link DEFAULT_MAX_LINES} lines / {@link DEFAULT_MAX_BYTES}
+ * bytes, while {@link formatNestedContextBlock} is uncapped. If the file exceeds either limit
+ * it is delivered truncated, so suppressing (and permanently marking loaded) would silently
+ * drop the remainder. Any stat/read failure also returns `false` — the safe double-load.
+ *
+ * `rendered` selects which delivery the measure must mirror:
+ *  - `read` delivers the file's raw content unchanged (`truncateHead` with no transform), so
+ *    the raw byte/line count is exact.
+ *  - `bash` delivers `truncateTail(renderTerminalOutput(...))`, and terminal rendering expands
+ *    tabs to 8-column stops and resolves cursor/ANSI sequences — the rendered output can be
+ *    *larger* than the file on disk. A tab-dense file just under the budget on disk can render
+ *    past it and be tail-truncated (its head dropped) while the raw measure still reports a
+ *    full delivery. Measuring the rendered output keeps the failure mode a harmless double-load
+ *    rather than a silent context drop.
+ */
+function deliveredInFull(realPath: string, rendered: boolean): boolean {
+	try {
+		// Cheap early-out: the raw on-disk size is a lower bound on the delivered size
+		// (terminal rendering only ever grows the byte count), so a file already over the
+		// byte budget on disk is certainly delivered truncated.
+		if (statSync(realPath).size > DEFAULT_MAX_BYTES) return false;
+		const raw = readFileSync(realPath, "utf8");
+		const delivered = rendered ? renderTerminalOutput(raw) : raw;
+		if (Buffer.byteLength(delivered, "utf-8") > DEFAULT_MAX_BYTES) return false;
+		return delivered.split("\n").length <= DEFAULT_MAX_LINES;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -312,7 +502,32 @@ export function computeNestedContextBlock(
 	const realTarget = safeRealpath(targetDir);
 	if (state.scannedDirs.has(realTarget)) return null;
 
-	const collected = collectNestedContext(targetDir, state.cwd, state.loaded);
+	// A context file the triggering tool already delivers should be marked loaded but not
+	// re-injected (the result already contains it). Two cases: a `read` of the file itself,
+	// or a `bash` command that dumps its full contents (`cat`/`bat`). Both are matched by
+	// full resolved realpath — never by basename — so printing one file never suppresses a
+	// same-named sibling/ancestor or a file in a different directory.
+	const selfReadFile = resolveSelfReadFile(toolName, args, state.cwd);
+	const realSelfReadFile = selfReadFile ? safeRealpath(selfReadFile) : null;
+	const bashCommand = toolName === "bash" && typeof args?.command === "string" ? args.command : null;
+	// Bash file arguments resolve against the command's effective cwd, which `resolveTargetDir`
+	// has already computed as `targetDir` (the leading `cd` destination).
+	const bashDelivered = bashCommand
+		? new Set(resolveBashDeliveredFiles(bashCommand, targetDir).map(safeRealpath))
+		: null;
+	const suppress: SuppressPredicate = (file) => {
+		const realFile = safeRealpath(file.path);
+		// Only suppress when the file was delivered *in full*: a truncated delivery (oversized
+		// file) would drop the remainder if we marked it fully loaded and skipped injection.
+		// `read` delivers the file's raw content unchanged; `bash` delivers it through terminal
+		// rendering (tab/ANSI expansion can grow it past the truncation budget), so each path
+		// measures fullness against what it actually emits.
+		if (realFile === realSelfReadFile) return deliveredInFull(realFile, false);
+		if (bashDelivered?.has(realFile)) return deliveredInFull(realFile, true);
+		return false;
+	};
+
+	const collected = collectNestedContext(targetDir, state.cwd, state.loaded, suppress);
 	if (!collected.hadReadError) {
 		state.scannedDirs.add(realTarget);
 	}

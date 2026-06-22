@@ -8,8 +8,11 @@ import {
 	formatNestedContextBlock,
 	type NestedContextState,
 	parseLeadingCd,
+	resolveBashDeliveredFiles,
+	resolveSelfReadFile,
 	resolveTargetDir,
 } from "../src/core/nested-context.js";
+import { DEFAULT_MAX_LINES } from "../src/core/tools/truncate.js";
 
 const itIfFilePermissionsApply =
 	process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0) ? it.skip : it;
@@ -391,6 +394,446 @@ describe("computeNestedContextBlock (orchestration)", () => {
 	it("returns null for tool calls that do not resolve to a directory", () => {
 		expect(computeNestedContextBlock("bash", { command: "ls -la" }, freshState())).toBeNull();
 		expect(computeNestedContextBlock("tasks_update", { tasks: [] }, freshState())).toBeNull();
+	});
+
+	it("does not duplicate a context file the read tool itself delivers", () => {
+		const state = freshState();
+		// The first action in `sub` is to read its own CLAUDE.md — the read result already
+		// contains it, so the injected block must not duplicate it.
+		const block = computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, state);
+		expect(block).toBeNull();
+		// Still marked loaded (never re-injected) and the dir is still negatively cached.
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+		expect(state.scannedDirs.has(realpathSync(sub))).toBe(true);
+	});
+
+	it("still injects an ancestor context file when reading a nested context file", () => {
+		// Ancestor (cwd) also has an unloaded context file.
+		writeFileSync(join(cwd, "AGENTS.md"), "# root context");
+		const state = freshState();
+		const block = computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, state);
+		// sub/CLAUDE.md is suppressed (read delivers it) but the ancestor is still injected.
+		expect(block).not.toBeNull();
+		expect(block).toContain("# root context");
+		expect(block).not.toContain("# sub context");
+		// Both files end up marked loaded.
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+		expect(state.loaded.has(realpathSync(join(cwd, "AGENTS.md")))).toBe(true);
+	});
+
+	it("does not duplicate a context file a bash command prints", () => {
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, state);
+		expect(block).toBeNull();
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+		expect(state.scannedDirs.has(realpathSync(sub))).toBe(true);
+	});
+
+	it("only suppresses the context file a bash command dumps, injecting siblings", () => {
+		writeFileSync(join(sub, "AGENTS.md"), "# sub agents");
+		const state = freshState();
+		// Command dumps AGENTS.md only — CLAUDE.md must still be injected.
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat AGENTS.md` }, state);
+		expect(block).not.toBeNull();
+		expect(block).toContain("# sub context");
+		expect(block).not.toContain("# sub agents");
+		expect(state.loaded.has(realpathSync(join(sub, "AGENTS.md")))).toBe(true);
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+	});
+
+	it("still injects when a bash command names a context file with a non-dumping verb", () => {
+		// grep/rm/wc/git-add/stat/ls reference the file but do NOT deliver its full content,
+		// so the context must still be injected rather than silently suppressed.
+		for (const command of [
+			`cd ${sub} && grep TODO CLAUDE.md`,
+			`cd ${sub} && rm CLAUDE.md`,
+			`cd ${sub} && wc -l CLAUDE.md`,
+			`cd ${sub} && git add CLAUDE.md`,
+			`cd ${sub} && stat CLAUDE.md`,
+			`cd ${sub} && ls -la CLAUDE.md`,
+		]) {
+			const state = freshState();
+			const block = computeNestedContextBlock("bash", { command }, state);
+			expect(block, command).toContain("# sub context");
+		}
+	});
+
+	it("still injects when a bash command only partially dumps the file (head/tail)", () => {
+		// head/tail/less/more may show only a fragment; suppressing would silently drop the rest.
+		for (const verb of ["head", "tail", "head -n 5", "less", "more"]) {
+			const state = freshState();
+			const block = computeNestedContextBlock("bash", { command: `cd ${sub} && ${verb} CLAUDE.md` }, state);
+			expect(block, verb).toContain("# sub context");
+		}
+	});
+
+	it("still injects when the dumped output is piped or redirected away", () => {
+		for (const command of [`cd ${sub} && cat CLAUDE.md | grep TODO`, `cd ${sub} && cat CLAUDE.md > out.txt`]) {
+			const state = freshState();
+			const block = computeNestedContextBlock("bash", { command }, state);
+			expect(block, command).toContain("# sub context");
+		}
+	});
+
+	it("does not drop a same-named ancestor when a nested context file is dumped", () => {
+		// Both cwd and sub have a CLAUDE.md (same basename, different dirs).
+		writeFileSync(join(cwd, "CLAUDE.md"), "# root context");
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, state);
+		// sub/CLAUDE.md is suppressed (the command dumped it) but the ancestor is still injected.
+		expect(block).not.toBeNull();
+		expect(block).toContain("# root context");
+		expect(block).not.toContain("# sub context");
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+		expect(state.loaded.has(realpathSync(join(cwd, "CLAUDE.md")))).toBe(true);
+	});
+
+	it("does not suppress a same-named file dumped from a different directory", () => {
+		// Command cds into sub but dumps a CLAUDE.md from an unrelated absolute path.
+		const other = join(tempDir, "other");
+		mkdirSync(other, { recursive: true });
+		writeFileSync(join(other, "CLAUDE.md"), "# other context");
+		const state = freshState();
+		const block = computeNestedContextBlock(
+			"bash",
+			{ command: `cd ${sub} && cat ${join(other, "CLAUDE.md")}` },
+			state,
+		);
+		// sub/CLAUDE.md was not the file dumped, so it must still be injected.
+		expect(block).toContain("# sub context");
+	});
+
+	it("does not suppress the real context file when a derived (.bak) copy is dumped", () => {
+		writeFileSync(join(sub, "CLAUDE.md.bak"), "# stale backup");
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md.bak` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("does not suppress a .dreb/CONTEXT.md when a top-level CONTEXT.md is dumped", () => {
+		// The subdir candidate's basename collapses to CONTEXT.md, but it is a different
+		// file than `sub/CONTEXT.md`, so dumping the latter must not suppress the former.
+		mkdirSync(join(sub, ".dreb"), { recursive: true });
+		writeFileSync(join(sub, ".dreb", "CONTEXT.md"), "# dreb context");
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CONTEXT.md` }, state);
+		expect(block).toContain("# dreb context");
+	});
+
+	it("suppresses a .dreb/CONTEXT.md that is read directly", () => {
+		mkdirSync(join(sub, ".dreb"), { recursive: true });
+		writeFileSync(join(sub, ".dreb", "CONTEXT.md"), "# dreb context");
+		const state = freshState();
+		const block = computeNestedContextBlock("read", { path: join(sub, ".dreb", "CONTEXT.md") }, state);
+		// The read delivered the .dreb file; it must not be re-injected but the sibling
+		// CLAUDE.md the read did not touch must still appear.
+		expect(block).not.toContain("# dreb context");
+		expect(block).toContain("# sub context");
+		expect(state.loaded.has(realpathSync(join(sub, ".dreb", "CONTEXT.md")))).toBe(true);
+	});
+
+	it("still injects when a bash command only cds without printing the context file", () => {
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && ls -la` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("still injects when the read tool targets a non-context file", () => {
+		const state = freshState();
+		const block = computeNestedContextBlock("read", { path: join(sub, "file.py") }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	itIfSymlinksApply("suppresses a context file read through a symlinked path", () => {
+		const realSub = join(cwd, "real-ctx");
+		const linkedSub = join(cwd, "linked-ctx");
+		mkdirSync(realSub, { recursive: true });
+		writeFileSync(join(realSub, "CLAUDE.md"), "# linked context");
+		symlinkSync(realSub, linkedSub, "dir");
+
+		const state = freshState();
+		const block = computeNestedContextBlock("read", { path: join(linkedSub, "CLAUDE.md") }, state);
+		expect(block).toBeNull();
+		expect(state.loaded.has(realpathSync(join(realSub, "CLAUDE.md")))).toBe(true);
+	});
+
+	it("still injects when a read is sliced via offset/limit (partial delivery)", () => {
+		// A sliced read delivers only a fragment, so the full context file must still inject.
+		const state = freshState();
+		const block = computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md"), offset: 1, limit: 1 }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("still injects when bat shows only a partial range", () => {
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && bat -r 1:2 CLAUDE.md` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("still injects when a here-doc merely mentions a context filename", () => {
+		// `cat <<EOF ... CLAUDE.md ... EOF` outputs literal text, not the file.
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat <<EOF\nsee CLAUDE.md\nEOF` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("still injects when the command chains multiple cds (ambiguous cwd)", () => {
+		// The cat runs in the final cwd, not the first; resolving against the first would
+		// suppress the wrong same-named file, so suppression is skipped entirely.
+		writeFileSync(join(cwd, "CLAUDE.md"), "# root context");
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${cwd} && cd sub && cat CLAUDE.md` }, state);
+		// targetDir is cwd; cwd/CLAUDE.md must not be suppressed by the ambiguous chained cd.
+		expect(block).toContain("# root context");
+	});
+
+	it("still injects an oversized context file the tool can only deliver truncated", () => {
+		// Beyond the tool's truncation limit the delivered content is incomplete, while the
+		// injected block is uncapped — suppressing would silently drop the remainder.
+		writeFileSync(join(sub, "CLAUDE.md"), `# sub context\n${"x\n".repeat(2100)}`);
+		const readState = freshState();
+		expect(computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, readState)).toContain("# sub context");
+		const bashState = freshState();
+		expect(computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, bashState)).toContain(
+			"# sub context",
+		);
+	});
+
+	it("still injects a context file that is over the byte budget but under the line limit", () => {
+		// A few-line file larger than 50KB (one very long line) is delivered truncated by
+		// both `read` and `cat`, so the byte-size guard in deliveredInFull must still inject.
+		writeFileSync(join(sub, "CLAUDE.md"), `# sub context\n${"x".repeat(60_000)}`);
+		const readState = freshState();
+		expect(computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, readState)).toContain("# sub context");
+		const bashState = freshState();
+		expect(computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, bashState)).toContain(
+			"# sub context",
+		);
+	});
+
+	it("still injects when a cat renders past the byte budget via tab expansion", () => {
+		// The bash tool delivers truncateTail(renderTerminalOutput(...)), which expands tabs
+		// to 8-column stops. A tab-dense file ~7KB on disk renders to ~56KB, so `cat` delivers
+		// it truncated even though the raw file is well under budget — measuring the raw file
+		// would falsely suppress it (silent drop). `read` delivers the raw content unchanged,
+		// so the same file IS fully delivered by read and is correctly suppressed there.
+		writeFileSync(join(sub, "CLAUDE.md"), `# sub context\n${"\t".repeat(7000)}X`);
+		const bashState = freshState();
+		expect(computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, bashState)).toContain(
+			"# sub context",
+		);
+		// read path: raw content is within budget, so it is delivered in full → suppressed.
+		const readState = freshState();
+		expect(computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, readState)).toBeNull();
+		expect(readState.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+	});
+
+	it("suppresses at exactly the line limit but injects one line over it", () => {
+		// Pin the deliveredInFull line-count boundary: a file whose split("\n") length is
+		// exactly DEFAULT_MAX_LINES is delivered in full (suppress); one line more is
+		// truncated by the tool (inject). Guards against a future off-by-one regression.
+		// `"line\n".repeat(n)` splits into n + 1 elements (trailing empty), so use n - 1 / n.
+		const atLimit = `${"line\n".repeat(DEFAULT_MAX_LINES - 1)}`;
+		writeFileSync(join(sub, "CLAUDE.md"), atLimit);
+		const atState = freshState();
+		expect(computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, atState)).toBeNull();
+		expect(atState.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+
+		const overLimit = `${"line\n".repeat(DEFAULT_MAX_LINES)}`;
+		writeFileSync(join(sub, "CLAUDE.md"), overLimit);
+		const overState = freshState();
+		const block = computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, overState);
+		expect(block).not.toBeNull();
+		expect(block).toContain("line");
+	});
+
+	it("still injects when a context file is dumped by an uppercase (non-existent) command", () => {
+		// `CAT`/`Bat` are command-not-found on Linux (case-sensitive PATH lookup) and emit
+		// nothing to stdout, so they must not suppress — the result never contained the file.
+		for (const verb of ["CAT", "Cat", "BAT", "Bat"]) {
+			const state = freshState();
+			const block = computeNestedContextBlock("bash", { command: `cd ${sub} && ${verb} CLAUDE.md` }, state);
+			expect(block, verb).toContain("# sub context");
+		}
+	});
+
+	it("still injects when a bash dump is followed by other output (tail truncation hazard)", () => {
+		// `cat CLAUDE.md && npm test` can push the dumped file out of the tail-truncated
+		// window, so it must not be suppressed — only a sole single-file dump qualifies.
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md && echo done` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("still injects when bat shows only a partial range via an attached short flag", () => {
+		// `bat -r10:20` (attached value) emits only a range, like `head`/`tail`.
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && bat -r10:20 CLAUDE.md` }, state);
+		expect(block).toContain("# sub context");
+	});
+
+	it("does not suppress a sibling .claude/CLAUDE.md when a top-level CLAUDE.md is dumped", () => {
+		// `.claude/CLAUDE.md`'s basename collapses to CLAUDE.md, but it is a different file
+		// than `sub/CLAUDE.md`; full-path matching must keep them distinct.
+		mkdirSync(join(sub, ".claude"), { recursive: true });
+		writeFileSync(join(sub, ".claude", "CLAUDE.md"), "# claude-dir context");
+		const state = freshState();
+		const block = computeNestedContextBlock("bash", { command: `cd ${sub} && cat CLAUDE.md` }, state);
+		expect(block).toContain("# claude-dir context");
+		expect(block).not.toContain("# sub context");
+	});
+
+	it("does not re-inject a suppressed context file when a deeper dir is later touched", () => {
+		// Exercises the permanent-loaded invariant across a later, deeper-dir call (the
+		// negative cache only short-circuits the *same* dir, not a child).
+		const deeper = join(sub, "deeper");
+		mkdirSync(deeper, { recursive: true });
+		writeFileSync(join(deeper, "AGENTS.md"), "# deeper context");
+		writeFileSync(join(deeper, "file.py"), "y = 2\n");
+		const state = freshState();
+		// First: read sub/CLAUDE.md → suppressed (delivered) + marked loaded, sub scanned.
+		expect(computeNestedContextBlock("read", { path: join(sub, "CLAUDE.md") }, state)).toBeNull();
+		expect(state.loaded.has(realpathSync(join(sub, "CLAUDE.md")))).toBe(true);
+		// Later: operate in sub/deeper (not yet scanned). The walk re-passes through sub but
+		// must not resurface the already-loaded sub/CLAUDE.md; only deeper's context is new.
+		const block = computeNestedContextBlock("read", { path: join(deeper, "file.py") }, state);
+		expect(block).toContain("# deeper context");
+		expect(block).not.toContain("# sub context");
+	});
+});
+
+describe("resolveSelfReadFile", () => {
+	it("resolves a relative read path against cwd", () => {
+		expect(resolveSelfReadFile("read", { path: "sub/CLAUDE.md" }, "/proj")).toBe("/proj/sub/CLAUDE.md");
+	});
+
+	it("returns an absolute read path unchanged", () => {
+		expect(resolveSelfReadFile("read", { path: "/a/AGENTS.md" }, "/proj")).toBe("/a/AGENTS.md");
+	});
+
+	it("expands a leading ~", () => {
+		expect(resolveSelfReadFile("read", { path: "~/x/CLAUDE.md" }, "/proj")).toBe(join(homedir(), "x/CLAUDE.md"));
+	});
+
+	it("returns null for non-read tools (they do not echo the full file)", () => {
+		expect(resolveSelfReadFile("grep", { path: "/a/CLAUDE.md" }, "/proj")).toBeNull();
+		expect(resolveSelfReadFile("ls", { path: "/a" }, "/proj")).toBeNull();
+		expect(resolveSelfReadFile("bash", { command: "cat x" }, "/proj")).toBeNull();
+	});
+
+	it("returns null when path is missing or empty", () => {
+		expect(resolveSelfReadFile("read", {}, "/proj")).toBeNull();
+		expect(resolveSelfReadFile("read", { path: "   " }, "/proj")).toBeNull();
+	});
+
+	it("returns null for a sliced read (offset/limit delivers only a fragment)", () => {
+		expect(resolveSelfReadFile("read", { path: "CLAUDE.md", offset: 10 }, "/proj")).toBeNull();
+		expect(resolveSelfReadFile("read", { path: "CLAUDE.md", limit: 5 }, "/proj")).toBeNull();
+		expect(resolveSelfReadFile("read", { path: "CLAUDE.md", offset: 1, limit: 5 }, "/proj")).toBeNull();
+	});
+});
+
+describe("resolveBashDeliveredFiles", () => {
+	it("resolves a cat argument against the working directory", () => {
+		expect(resolveBashDeliveredFiles("cat CLAUDE.md", "/proj/sub")).toEqual(["/proj/sub/CLAUDE.md"]);
+	});
+
+	it("does not treat a multi-file dump as a full delivery (tail truncation can evict an earlier file)", () => {
+		// The bash tool tail-truncates the *combined* output, so `cat A.md B.md` cannot
+		// guarantee A.md survived. Only a single-operand dump is a provable full delivery.
+		expect(resolveBashDeliveredFiles("cat A.md B.md", "/proj")).toEqual([]);
+	});
+
+	it("does not treat a dump followed by other output as a full delivery", () => {
+		// `cat CLAUDE.md && npm test` floods the tail with test output; the dumped file can
+		// be truncated away from the visible window, so it must not be suppressed.
+		expect(resolveBashDeliveredFiles("cat CLAUDE.md && npm test", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("cat CLAUDE.md && echo done", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("echo start && cat CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("returns an absolute argument unchanged", () => {
+		expect(resolveBashDeliveredFiles("cat /a/CLAUDE.md", "/proj")).toEqual(["/a/CLAUDE.md"]);
+	});
+
+	it("expands a leading ~ in an argument", () => {
+		expect(resolveBashDeliveredFiles("cat ~/x/CLAUDE.md", "/proj")).toEqual([join(homedir(), "x/CLAUDE.md")]);
+	});
+
+	it("supports bat as a full-dump command", () => {
+		expect(resolveBashDeliveredFiles("bat CLAUDE.md", "/proj")).toEqual(["/proj/CLAUDE.md"]);
+	});
+
+	it("ignores flags and only collects file arguments", () => {
+		expect(resolveBashDeliveredFiles("cat -n CLAUDE.md", "/proj")).toEqual(["/proj/CLAUDE.md"]);
+	});
+
+	it("strips surrounding quotes from an argument", () => {
+		expect(resolveBashDeliveredFiles('cat "CLAUDE.md"', "/proj")).toEqual(["/proj/CLAUDE.md"]);
+	});
+
+	it("does not treat partial/interactive viewers as full delivery", () => {
+		expect(resolveBashDeliveredFiles("head CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("tail -n 5 CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("less CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("does not treat non-dumping verbs as delivery", () => {
+		expect(resolveBashDeliveredFiles("grep TODO CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("rm CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("git add CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("wc -l CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("skips a dump whose output is piped or redirected away", () => {
+		expect(resolveBashDeliveredFiles("cat CLAUDE.md | grep x", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("cat CLAUDE.md > out.txt", "/proj")).toEqual([]);
+	});
+
+	it("skips a segment using a here-doc / here-string / input redirection", () => {
+		// Tokens after `<<`/`<<<`/`<` are stdin body words, not dumped files — a heredoc that
+		// merely mentions a context filename must not suppress it.
+		expect(resolveBashDeliveredFiles("cat <<EOF\nsee CLAUDE.md\nEOF", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("cat <<< CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("cat < CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("returns nothing when the command chains more than one cd (ambiguous cwd)", () => {
+		// Only the first `cd` is resolved into `workingDir`; a second `cd` makes operand
+		// resolution wrong, so bail to the safe double-load.
+		expect(resolveBashDeliveredFiles("cd /proj && cd sub && cat CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("does not treat bat's partial-range flag as a full dump", () => {
+		expect(resolveBashDeliveredFiles("bat -r 10:20 CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("bat --line-range 10:20 CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("bat --line-range=10:20 CLAUDE.md", "/proj")).toEqual([]);
+		// Attached short-flag form (`-r10:20`) — clap accepts an attached value.
+		expect(resolveBashDeliveredFiles("bat -r10:20 CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("collects a cat that follows a leading cd segment", () => {
+		expect(resolveBashDeliveredFiles("cd /proj/sub && cat CLAUDE.md", "/proj/sub")).toEqual(["/proj/sub/CLAUDE.md"]);
+	});
+
+	it("does not treat an uppercase command as a full dump (case-sensitive verb match)", () => {
+		// Shell PATH lookup is case-sensitive on Linux: `CAT`/`Bat` are command-not-found and
+		// emit nothing, so they must not be treated as delivering the file.
+		expect(resolveBashDeliveredFiles("CAT CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("Cat CLAUDE.md", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("BAT CLAUDE.md", "/proj")).toEqual([]);
+	});
+
+	it("returns nothing for a full-dump command with no file operand", () => {
+		// `cat` / `cat -n` reading stdin (or a flag-only invocation) names no file, so there
+		// is nothing to suppress — the operand-count guard must keep it the safe direction.
+		expect(resolveBashDeliveredFiles("cat", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("cat -n", "/proj")).toEqual([]);
+		expect(resolveBashDeliveredFiles("bat --plain", "/proj")).toEqual([]);
+	});
+
+	it("returns an empty list for an empty command", () => {
+		expect(resolveBashDeliveredFiles("", "/proj")).toEqual([]);
 	});
 });
 
