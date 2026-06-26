@@ -142,11 +142,54 @@ interface Component {
 
 | Method | Description |
 |--------|-------------|
-| `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
+| `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. The one exception is soft-wrappable lines — see below. |
 | `handleInput?(data)` | Called when the component has focus and receives keyboard input. The `data` string contains raw terminal input (may include ANSI escape sequences). |
 | `invalidate?()` | Called to clear any cached render state. Components should re-render from scratch on the next `render()` call. |
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
+
+### Soft-wrappable lines (clean copy/paste)
+
+By default a component must hard-wrap its own output so that one emitted line equals exactly one terminal row. That keeps rendering predictable, but it injects real newlines into wide content — so when a user selects and copies wide prose or a long code line from the terminal scrollback, the copied text contains spurious line breaks.
+
+A component can instead emit a line as **soft-wrappable**: the renderer leaves it un-wrapped and lets the terminal lay it out under its own autowrap, so it remains a *single logical line* in scrollback and copies cleanly with no injected newlines.
+
+This is deliberately **character-level** wrapping (the terminal wraps at its right edge), not word-aware. That is a hard constraint, not a shortcut: terminals only join wrapped rows on copy when they see a continuous run of printing characters flow past the margin under their own autowrap. The moment a component forces its own break — a newline, or padding the row out with spaces to trigger the wrap at a word boundary — that break lands in the copied text (as a newline or a run of spaces). So word-aware breaks and clean terminal copy are mutually exclusive; clean copy wins here, because copyability is the whole point.
+
+```typescript
+import { markWrappable } from "@dreb/tui";
+
+render(width: number): string[] {
+  // This line may exceed `width`; the terminal will soft-wrap it and it will
+  // copy as one logical line.
+  return [markWrappable("a very long line of prose that exceeds the width …")];
+}
+```
+
+Contract for a soft-wrappable line:
+
+- Prefix it with `markWrappable(line)` (a zero-width APC sentinel the renderer strips before writing).
+- **Do not** hard-wrap it (don't pass it through `wrapTextWithAnsi()`) and **do not** pad it to the full width with spaces — those don't survive terminal autowrap and trailing space padding pollutes the copied text. Left padding/indent is fine; it becomes part of the single logical line.
+- A **background fill** is allowed, but it must be drawn with erase-to-end-of-line (`\x1b[K`, "background-color erase") rather than padded spaces — use `applyBackgroundErase(line, bgFn)`. The terminal paints the erased cells with the active background (so the row is a full-width block on every wrapped row) but excludes those erased cells from a copy, so the line still copies clean. This is the `\x1b[K` "terminal contract" that ncurses apps follow; `visibleWidth()`/`extractAnsiCode()` already treat `\x1b[K` as zero-width so row-counting and the guard are unaffected.
+- A marked line **may exceed `width`** — that is the whole point. Unmarked lines keep the strict "must not exceed `width`" invariant and still trigger the loud over-width guard.
+
+Helpers (`@dreb/tui`): `WRAP_MARKER`, `markWrappable`, `isWrappableLine`, `stripWrapMarker`, `screenRowsForLine`, `screenPositionForColumn`, `splitToScreenRows`, `applyBackgroundErase`. The built-in `Text` and `Markdown` components accept an opt-in `softWrap` flag that emits prose, list, heading, blockquote and code-block lines this way; backgrounded content (e.g. user messages) is filled with `applyBackgroundErase` so it reads as a full-width block and still copies clean. Blockquotes drop the per-row `│` sidebar when soft-wrapping (it can't survive continuation rows) and are framed top/bottom by a rule instead, keeping the dim-italic body styling. Only structures whose layout genuinely depends on a fixed width stay hard-wrapped: **rendered markdown tables** (column alignment) and **UI chrome inside bounded boxes** — overlays, dialogs, the editor, status/footer — which would spill their borders if wrapped at the terminal edge rather than their box width.
+
+Manual copy verification matrix for soft-wrapped transcript content:
+
+| Terminal | Expected check |
+| --- | --- |
+| xterm-headless (`VirtualTerminal`) | Covered by automated tests: wrapped rows reconstruct as one logical line with no trailing-space padding. |
+| iTerm2 | Select a wrapped prose/code/tool line from scrollback; pasted text should contain no newline at terminal wrap points. |
+| Terminal.app | Same copy check; verify BCE-filled background rows do not add trailing spaces. |
+| VTE/GNOME Terminal | Same copy check. |
+| Konsole | Same copy check. |
+| kitty | Same copy check, including with Kitty image protocol enabled. |
+| alacritty | Same copy check. |
+| WezTerm | Same copy check. |
+| tmux | Same copy check inside a tmux pane. |
+| VS Code integrated terminal | Same copy check. |
+| Windows Terminal | Same copy check. |
 
 ### Focusable Interface (IME Support)
 

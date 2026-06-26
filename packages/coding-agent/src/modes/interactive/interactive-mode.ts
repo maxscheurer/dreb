@@ -580,7 +580,14 @@ export class InteractiveMode {
 					this.headerContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
 					this.headerContainer.addChild(new Spacer(1));
 					this.headerContainer.addChild(
-						new Markdown(this.changelogMarkdown.trim(), 1, 0, this.getMarkdownThemeWithSettings()),
+						new Markdown(
+							this.changelogMarkdown.trim(),
+							1,
+							0,
+							this.getMarkdownThemeWithSettings(),
+							undefined,
+							true,
+						),
 					);
 					this.headerContainer.addChild(new Spacer(1));
 				}
@@ -1188,7 +1195,7 @@ export class InteractiveMode {
 				const contextList = contextFiles
 					.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`))
 					.join("\n");
-				this.chatContainer.addChild(new Text(`${sectionHeader("Context")}\n${contextList}`, 0, 0));
+				this.chatContainer.addChild(new Text(`${sectionHeader("Context")}\n${contextList}`, 0, 0, undefined, true));
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1202,7 +1209,7 @@ export class InteractiveMode {
 						return theme.fg("dim", `  ${this.formatDisplayPath(m.dir)}/MEMORY.md${label}`);
 					})
 					.join("\n");
-				this.chatContainer.addChild(new Text(`${sectionHeader("Memory")}\n${memoryList}`, 0, 0));
+				this.chatContainer.addChild(new Text(`${sectionHeader("Memory")}\n${memoryList}`, 0, 0, undefined, true));
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1215,7 +1222,7 @@ export class InteractiveMode {
 					formatPath: (item) => this.formatDisplayPath(item.path),
 					formatPackagePath: (item) => this.getShortPath(item.path, item.sourceInfo),
 				});
-				this.chatContainer.addChild(new Text(`${sectionHeader("Skills")}\n${skillList}`, 0, 0));
+				this.chatContainer.addChild(new Text(`${sectionHeader("Skills")}\n${skillList}`, 0, 0, undefined, true));
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1235,7 +1242,9 @@ export class InteractiveMode {
 						return template ? `/${template.name}` : this.formatDisplayPath(item.path);
 					},
 				});
-				this.chatContainer.addChild(new Text(`${sectionHeader("Prompts")}\n${templateList}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(`${sectionHeader("Prompts")}\n${templateList}`, 0, 0, undefined, true),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1245,7 +1254,9 @@ export class InteractiveMode {
 					formatPath: (item) => this.formatDisplayPath(item.path),
 					formatPackagePath: (item) => this.getShortPath(item.path, item.sourceInfo),
 				});
-				this.chatContainer.addChild(new Text(`${sectionHeader("Extensions", "mdHeading")}\n${extList}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(`${sectionHeader("Extensions", "mdHeading")}\n${extList}`, 0, 0, undefined, true),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1263,7 +1274,7 @@ export class InteractiveMode {
 					formatPath: (item) => this.formatDisplayPath(item.path),
 					formatPackagePath: (item) => this.getShortPath(item.path, item.sourceInfo),
 				});
-				this.chatContainer.addChild(new Text(`${sectionHeader("Themes")}\n${themeList}`, 0, 0));
+				this.chatContainer.addChild(new Text(`${sectionHeader("Themes")}\n${themeList}`, 0, 0, undefined, true));
 				this.chatContainer.addChild(new Spacer(1));
 			}
 		}
@@ -1272,7 +1283,9 @@ export class InteractiveMode {
 			const skillDiagnostics = skillsResult.diagnostics;
 			if (skillDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(skillDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Skill conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(`${theme.fg("warning", "[Skill conflicts]")}\n${warningLines}`, 0, 0, undefined, true),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1280,7 +1293,7 @@ export class InteractiveMode {
 			if (promptDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(promptDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines}`, 0, 0),
+					new Text(`${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines}`, 0, 0, undefined, true),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1303,7 +1316,7 @@ export class InteractiveMode {
 			if (extensionDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(extensionDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Extension issues]")}\n${warningLines}`, 0, 0),
+					new Text(`${theme.fg("warning", "[Extension issues]")}\n${warningLines}`, 0, 0, undefined, true),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1311,7 +1324,9 @@ export class InteractiveMode {
 			const themeDiagnostics = themesResult.diagnostics;
 			if (themeDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(themeDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Theme conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(`${theme.fg("warning", "[Theme conflicts]")}\n${warningLines}`, 0, 0, undefined, true),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 		}
@@ -2175,7 +2190,7 @@ export class InteractiveMode {
 	 */
 	private showExtensionError(extensionPath: string, error: string, stack?: string): void {
 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
-		const errorText = new Text(theme.fg("error", errorMsg), 1, 0);
+		const errorText = new Text(theme.fg("error", errorMsg), 1, 0, undefined, true);
 		this.chatContainer.addChild(errorText);
 		if (stack) {
 			// Show stack trace in dim color, indented
@@ -2185,7 +2200,7 @@ export class InteractiveMode {
 				.map((line) => theme.fg("dim", `  ${line.trim()}`))
 				.join("\n");
 			if (stackLines) {
-				this.chatContainer.addChild(new Text(stackLines, 1, 0));
+				this.chatContainer.addChild(new Text(stackLines, 1, 0, undefined, true));
 			}
 		}
 		this.ui.requestRender();
@@ -2745,7 +2760,7 @@ export class InteractiveMode {
 				} else if (event.errorMessage) {
 					// Compaction failed (e.g., quota exceeded, API error)
 					this.chatContainer.addChild(new Spacer(1));
-					this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
+					this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0, undefined, true));
 				}
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
@@ -2917,7 +2932,7 @@ export class InteractiveMode {
 		}
 
 		const spacer = new Spacer(1);
-		const text = new Text(theme.fg("dim", message), 1, 0);
+		const text = new Text(theme.fg("dim", message), 1, 0, undefined, true);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -3473,13 +3488,13 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0, undefined, true));
 		this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0, undefined, true));
 		this.ui.requestRender();
 	}
 
@@ -3499,6 +3514,8 @@ export class InteractiveMode {
 				`${theme.bold(theme.fg("warning", "Update Available"))}\n${updateInstruction}\n${changelogLine}`,
 				1,
 				0,
+				undefined,
+				true,
 			),
 		);
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
@@ -3517,6 +3534,8 @@ export class InteractiveMode {
 				`${theme.bold(theme.fg("warning", "Package Updates Available"))}\n${updateInstruction}\n${theme.fg("muted", "Packages:")}\n${packageLines}`,
 				1,
 				0,
+				undefined,
+				true,
 			),
 		);
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
@@ -4709,7 +4728,9 @@ export class InteractiveMode {
 			const currentName = this.sessionManager.getSessionName();
 			if (currentName) {
 				this.chatContainer.addChild(new Spacer(1));
-				this.chatContainer.addChild(new Text(theme.fg("dim", `Session name: ${currentName}`), 1, 0));
+				this.chatContainer.addChild(
+					new Text(theme.fg("dim", `Session name: ${currentName}`), 1, 0, undefined, true),
+				);
 			} else {
 				this.showWarning("Usage: /name <name>");
 			}
@@ -4720,7 +4741,7 @@ export class InteractiveMode {
 		this.sessionManager.appendSessionInfo(name);
 		this.updateTerminalTitle();
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0, undefined, true));
 		this.ui.requestRender();
 	}
 
@@ -4757,7 +4778,7 @@ export class InteractiveMode {
 		}
 
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.chatContainer.addChild(new Text(info, 1, 0, undefined, true));
 		this.ui.requestRender();
 	}
 
@@ -4777,7 +4798,9 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new DynamicBorder());
 		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(
+			new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings(), undefined, true),
+		);
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
 	}
@@ -4921,7 +4944,9 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 		this.chatContainer.addChild(new DynamicBorder());
 		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(
+			new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings(), undefined, true),
+		);
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
 	}
@@ -4978,7 +5003,13 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
-			new Text(`${theme.fg("accent", "✓ Debug log written")}\n${theme.fg("muted", debugLogPath)}`, 1, 1),
+			new Text(
+				`${theme.fg("accent", "✓ Debug log written")}\n${theme.fg("muted", debugLogPath)}`,
+				1,
+				1,
+				undefined,
+				true,
+			),
 		);
 		this.ui.requestRender();
 	}
@@ -5325,7 +5356,7 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 					this.removeBuddy();
 					this.chatContainer.addChild(new Spacer(1));
 					this.chatContainer.addChild(
-						new Text(theme.fg("muted", "Buddy hidden. Use /buddy to bring them back."), 1, 0),
+						new Text(theme.fg("muted", "Buddy hidden. Use /buddy to bring them back."), 1, 0, undefined, true),
 					);
 					this.ui.requestRender();
 					break;
@@ -5341,7 +5372,7 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 				}
 				case "model": {
 					this.chatContainer.addChild(new Spacer(1));
-					this.chatContainer.addChild(new Text(result.message, 1, 0));
+					this.chatContainer.addChild(new Text(result.message, 1, 0, undefined, true));
 					this.ui.requestRender();
 					break;
 				}
@@ -5466,13 +5497,15 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 					),
 					1,
 					0,
+					undefined,
+					true,
 				),
 			);
 			return;
 		}
 		const nudge = this.buddyController.getModelNudge();
 		if (nudge) {
-			this.chatContainer.addChild(new Text(theme.fg("warning", `⚠️ ${nudge}`), 1, 0));
+			this.chatContainer.addChild(new Text(theme.fg("warning", `⚠️ ${nudge}`), 1, 0, undefined, true));
 		}
 	}
 

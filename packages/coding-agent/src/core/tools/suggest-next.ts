@@ -99,7 +99,7 @@ export function createSuggestNextToolDefinition(
 		},
 
 		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0, undefined, true);
 			text.setText(formatSuggestNextCall(args, theme));
 			return text;
 		},
@@ -107,7 +107,7 @@ export function createSuggestNextToolDefinition(
 		renderResult(result, _options, theme, context) {
 			const details = (result as any).details as SuggestNextDetails | undefined;
 			if (!details) {
-				const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+				const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0, undefined, true);
 				const content = result.content?.[0];
 				const msg = content?.type === "text" && content.text ? content.text : "";
 				text.setText(theme.fg("toolOutput", msg));
@@ -117,12 +117,12 @@ export function createSuggestNextToolDefinition(
 			if (details.summary) {
 				const container = (context.lastComponent as Container | undefined) ?? new Container();
 				container.clear();
-				container.addChild(new Markdown(details.summary, 0, 0, getMarkdownTheme()));
-				container.addChild(new Text(theme.fg("toolOutput", `→ ${details.suggestion}`), 0, 0));
+				container.addChild(new Markdown(details.summary, 0, 0, getMarkdownTheme(), undefined, true));
+				container.addChild(new Text(theme.fg("toolOutput", `→ ${details.suggestion}`), 0, 0, undefined, true));
 				return container;
 			}
 
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0, undefined, true);
 			text.setText(theme.fg("toolOutput", `→ ${details.suggestion}`));
 			return text;
 		},

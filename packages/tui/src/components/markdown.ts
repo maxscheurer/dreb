@@ -1,7 +1,8 @@
 import { marked, type Token } from "marked";
 import { isImageLine } from "../terminal-image.js";
 import type { Component } from "../tui.js";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { applyBackgroundErase, applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { isWrappableLine, markWrappable, stripWrapMarker } from "../wrap.js";
 
 /**
  * Default text styling for markdown content.
@@ -57,6 +58,7 @@ export class Markdown implements Component {
 	private paddingY: number; // Top/bottom padding
 	private defaultTextStyle?: DefaultTextStyle;
 	private theme: MarkdownTheme;
+	private softWrap: boolean;
 	private defaultStylePrefix?: string;
 
 	// Cache for rendered output
@@ -70,12 +72,14 @@ export class Markdown implements Component {
 		paddingY: number,
 		theme: MarkdownTheme,
 		defaultTextStyle?: DefaultTextStyle,
+		softWrap = false,
 	) {
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
 		this.theme = theme;
 		this.defaultTextStyle = defaultTextStyle;
+		this.softWrap = softWrap;
 	}
 
 	setText(text: string): void {
@@ -127,7 +131,7 @@ export class Markdown implements Component {
 		// Wrap lines (NO padding, NO background yet)
 		const wrappedLines: string[] = [];
 		for (const line of renderedLines) {
-			if (isImageLine(line)) {
+			if (isImageLine(line) || (this.softWrap && isWrappableLine(line))) {
 				wrappedLines.push(line);
 			} else {
 				for (const wl of wrapTextWithAnsi(line, contentWidth)) wrappedLines.push(wl);
@@ -135,14 +139,28 @@ export class Markdown implements Component {
 		}
 
 		// Add margins and background to each wrapped line
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
+		// Horizontal padding cannot be honored on the terminal-produced continuation
+		// rows of a soft-wrapped line, so applying it only to the first row would both
+		// misalign the wrapped rows and inject a leading space into the copy. In
+		// soft-wrap mode we therefore drop horizontal padding entirely (flush-left).
+		const leftMargin = this.softWrap ? "" : " ".repeat(this.paddingX);
+		const rightMargin = this.softWrap ? "" : " ".repeat(this.paddingX);
 		const bgFn = this.defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
 
 		for (const line of wrappedLines) {
 			if (isImageLine(line)) {
 				contentLines.push(line);
+				continue;
+			}
+
+			if (this.softWrap && isWrappableLine(line)) {
+				// Soft-wrappable: emit a single un-padded logical line (the terminal wraps
+				// it; it copies clean). When a background is set, fill the row to full width
+				// with erase-to-EOL (BCE) rather than spaces — that paints a full-width
+				// block on every wrapped row while keeping the copy free of trailing junk.
+				const stripped = leftMargin + stripWrapMarker(line);
+				contentLines.push(markWrappable(bgFn ? applyBackgroundErase(stripped, bgFn) : stripped));
 				continue;
 			}
 
@@ -162,7 +180,14 @@ export class Markdown implements Component {
 		const emptyLine = " ".repeat(width);
 		const emptyLines: string[] = [];
 		for (let i = 0; i < this.paddingY; i++) {
-			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
+			let line: string;
+			if (bgFn) {
+				// Fill the margin row with the background. In soft-wrap mode use BCE so the
+				// row copies clean (no trailing spaces); otherwise pad to an exact width.
+				line = this.softWrap ? applyBackgroundErase("", bgFn) : applyBackgroundToLine(emptyLine, width, bgFn);
+			} else {
+				line = emptyLine;
+			}
 			emptyLines.push(line);
 		}
 
@@ -290,7 +315,7 @@ export class Markdown implements Component {
 
 				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
 				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
-				lines.push(styledHeading);
+				lines.push(this.softWrap ? markWrappable(styledHeading) : styledHeading);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)
 				}
@@ -299,7 +324,13 @@ export class Markdown implements Component {
 
 			case "paragraph": {
 				const paragraphText = this.renderInlineTokens(token.tokens || [], styleContext);
-				lines.push(paragraphText);
+				if (this.softWrap) {
+					for (const paragraphLine of paragraphText.split("\n")) {
+						lines.push(markWrappable(paragraphLine));
+					}
+				} else {
+					lines.push(paragraphText);
+				}
 				// Don't add spacing if next token is space or list
 				if (nextTokenType && nextTokenType !== "list" && nextTokenType !== "space") {
 					lines.push("");
@@ -313,13 +344,15 @@ export class Markdown implements Component {
 				if (this.theme.highlightCode) {
 					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
 					for (const hlLine of highlightedLines) {
-						lines.push(`${indent}${hlLine}`);
+						const codeLine = `${indent}${hlLine}`;
+						lines.push(this.softWrap ? markWrappable(codeLine) : codeLine);
 					}
 				} else {
 					// Split code by newlines and style each line
 					const codeLines = token.text.split("\n");
 					for (const codeLine of codeLines) {
-						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
+						const styledCodeLine = `${indent}${this.theme.codeBlock(codeLine)}`;
+						lines.push(this.softWrap ? markWrappable(styledCodeLine) : styledCodeLine);
 					}
 				}
 				lines.push(this.theme.codeBlockBorder("```"));
@@ -331,7 +364,8 @@ export class Markdown implements Component {
 
 			case "list": {
 				const listLines = this.renderList(token as any, 0, styleContext);
-				for (const line of listLines) lines.push(line);
+				// Each list line is prose and should soft-wrap as a single logical line.
+				for (const line of listLines) lines.push(this.softWrap && line !== "" ? markWrappable(line) : line);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
 				break;
@@ -354,8 +388,13 @@ export class Markdown implements Component {
 					return quoteStyle(lineWithReappliedStyle);
 				};
 
-				// Calculate available width for quote content (subtract border "│ " = 2 chars)
-				const quoteContentWidth = Math.max(1, width - 2);
+				// No left sidebar: a per-row "│ " prefix cannot survive soft-wrap
+				// continuation rows (the terminal, not us, produces them, so the bar would
+				// appear only on the first visual row). Frame the quote with a thin rule
+				// above and below instead — those occupy their own rows, so the body stays
+				// plain soft-wrappable text that wraps and copies clean. The dim italic
+				// quote styling is preserved.
+				const quoteContentWidth = width;
 
 				// Blockquotes contain block-level tokens (paragraph, list, code, etc.), so render
 				// children with renderToken() instead of renderInlineTokens().
@@ -379,13 +418,22 @@ export class Markdown implements Component {
 					renderedQuoteLines.pop();
 				}
 
+				const quoteRule = this.theme.quoteBorder("─".repeat(Math.max(1, Math.min(width, 60))));
+				lines.push(quoteRule);
 				for (const quoteLine of renderedQuoteLines) {
-					const styledLine = applyQuoteStyle(quoteLine);
+					const shouldSoftWrapQuoteLine = this.softWrap && isWrappableLine(quoteLine);
+					const unmarkedQuoteLine = shouldSoftWrapQuoteLine ? stripWrapMarker(quoteLine) : quoteLine;
+					const styledLine = applyQuoteStyle(unmarkedQuoteLine);
+					if (shouldSoftWrapQuoteLine) {
+						lines.push(markWrappable(styledLine));
+						continue;
+					}
 					const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
 					for (const wrappedLine of wrappedLines) {
-						lines.push(this.theme.quoteBorder("│ ") + wrappedLine);
+						lines.push(wrappedLine);
 					}
 				}
+				lines.push(quoteRule);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after blockquotes (unless space token follows)
 				}
